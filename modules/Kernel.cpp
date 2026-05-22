@@ -1,0 +1,227 @@
+#include "Kernel.hpp"
+#include <fstream>
+#include <string>
+#include <unistd.h>
+#include <cerrno>
+
+const std::string KernelSecurity::SYSCTL_CONF = "/etc/sysctl.d/99-spp.conf";
+
+bool KernelSecurity::writePersistenceConf(const std::vector<std::pair<std::string,std::string>>& entries) {
+    if (entries.empty())
+        return removePersistenceConf();
+    std::ofstream f(SYSCTL_CONF);
+    if (!f.is_open()) return false;
+    f << "# SPP - Systeme de Protection Patriote\n";
+    for (const auto& [key, val] : entries)
+        f << key << " = " << val << '\n';
+    return f.good();
+}
+
+bool KernelSecurity::removePersistenceConf() {
+    return unlink(SYSCTL_CONF.c_str()) == 0 || errno == ENOENT;
+}
+
+std::string KernelSecurity::procPath(const std::string& key) {
+    std::string path = "/proc/sys/";
+    for (char c : key)
+        path += (c == '.' ? '/' : c);
+    return path;
+}
+
+std::string KernelSecurity::readValue(const std::string& path) {
+    std::ifstream f(path);
+    std::string val;
+    if (!f.is_open())
+        return "";
+    std::getline(f, val);
+    auto end = val.find_last_not_of(" \t\r\n");
+    if (end != std::string::npos)
+        val = val.substr(0, end + 1);
+    return val;
+}
+
+bool KernelSecurity::writeValue(const std::string& path, const std::string& value) {
+    std::ofstream f(path);
+    if (!f.is_open())
+        return false;
+    f << value;
+    return f.good();
+}
+
+bool KernelSecurity::apply(const SysctlOption& opt) {
+    return writeValue(procPath(opt.key), opt.hardened);
+}
+
+bool KernelSecurity::revert(const SysctlOption& opt) {
+    return writeValue(procPath(opt.key), opt.defaults);
+}
+
+bool KernelSecurity::isHardened(const SysctlOption& opt) {
+    return readValue(procPath(opt.key)) == opt.hardened;
+}
+
+std::vector<SysctlOption> KernelSecurity::kernelOptions() {
+    return {
+        {
+            "ASLR complet",
+            "kernel.randomize_va_space", "2", "1",
+            "Randomise les adresses memoire des processus. Un exploit buffer overflow"
+            " ne peut pas predire ou atterrir en memoire."
+        },
+        {
+            "Restreindre dmesg",
+            "kernel.dmesg_restrict", "1", "0",
+            "Masque les logs kernel aux non-root. Ces logs contiennent des adresses"
+            " memoire et infos systeme utiles a un attaquant."
+        },
+        {
+            "Masquer pointeurs kernel",
+            "kernel.kptr_restrict", "2", "0",
+            "Cache les adresses kernel dans /proc/kallsyms. Sans ca, n'importe quel"
+            " utilisateur peut voir ou sont chargees les fonctions kernel."
+        },
+        {
+            "Restreindre ptrace",
+            "kernel.yama.ptrace_scope", "2", "0",
+            "Seul root peut attacher un debugger a un processus. Bloque les attaques"
+            " d'injection dans des processus en cours d'execution."
+        },
+        {
+            "Desactiver BPF non-root",
+            "kernel.unprivileged_bpf_disabled", "1", "0",
+            "BPF (Berkeley Packet Filter) est tres puissant et vecteur de nombreuses"
+            " CVEs recentes. Desactive pour les utilisateurs normaux."
+        },
+        {
+            "Restreindre perf events",
+            "kernel.perf_event_paranoid", "3", "1",
+            "Restreint l'acces aux compteurs de performance CPU. Reduit les attaques"
+            " side-channel de type Spectre utilisant ces compteurs."
+        },
+        {
+            "Core dumps avec PID",
+            "kernel.core_uses_pid", "1", "0",
+            "Ajoute le PID dans le nom des fichiers core dump. Evite qu'un dump"
+            " en ecrase un autre, utile pour l'audit forensique."
+        },
+        {
+            "Bloquer autoload TTY",
+            "dev.tty.ldisc_autoload", "0", "1",
+            "Empeche le chargement automatique des line disciplines TTY non-root."
+            " Bloque un vecteur d'exploitation peu connu permettant le chargement"
+            " de modules noyau non autorises."
+        },
+    };
+}
+
+std::vector<SysctlOption> KernelSecurity::fsOptions() {
+    return {
+        {
+            "Bloquer dumps SUID",
+            "fs.suid_dumpable", "0", "1",
+            "Empeche les programmes SUID (qui tournent en root) de generer des core"
+            " dumps pouvant contenir des cles ou mots de passe en memoire."
+        },
+        {
+            "Protection hardlinks",
+            "fs.protected_hardlinks", "1", "0",
+            "Empeche de creer un hardlink vers un fichier non-possede. Bloque les"
+            " attaques TOCTOU (Time-Of-Check Time-Of-Use)."
+        },
+        {
+            "Protection symlinks",
+            "fs.protected_symlinks", "1", "0",
+            "Empeche de suivre un symlink d'un autre utilisateur dans /tmp. Bloque"
+            " les attaques de race condition classiques sur les repertoires partagés."
+        },
+        {
+            "Protection FIFOs",
+            "fs.protected_fifos", "2", "0",
+            "Empeche l'ouverture de FIFOs appartenant a un autre utilisateur dans"
+            " un sticky directory (/tmp). Bloque les race conditions via pipes nommes."
+        },
+        {
+            "Protection fichiers reguliers",
+            "fs.protected_regular", "2", "0",
+            "Meme protection que FIFOs mais pour les fichiers reguliers dans sticky"
+            " dirs. Bloque les attaques TOCTOU sur les fichiers ordinaires."
+        },
+    };
+}
+
+std::vector<SysctlOption> KernelSecurity::netOptions() {
+    return {
+        {
+            "Anti-spoofing IP",
+            "net.ipv4.conf.all.rp_filter", "1", "0",
+            "Reverse Path Filtering : verifie que les paquets entrants arrivent par"
+            " la bonne interface. Bloque l'usurpation d'adresse IP."
+        },
+        {
+            "Bloquer redirections ICMP (IPv4)",
+            "net.ipv4.conf.all.accept_redirects", "0", "1",
+            "Refuse les redirections ICMP. Un attaquant reseau pourrait envoyer de"
+            " faux messages ICMP pour rediriger le trafic vers lui (man-in-the-middle)."
+        },
+        {
+            "Bloquer envoi redirections",
+            "net.ipv4.conf.all.send_redirects", "0", "1",
+            "Empeche la machine d'envoyer des redirections ICMP. Evite d'etre utilisee"
+            " involontairement comme relais dans une attaque reseau."
+        },
+        {
+            "Protection SYN flood",
+            "net.ipv4.tcp_syncookies", "1", "0",
+            "Active les SYN cookies. Protege contre les attaques SYN flood qui saturent"
+            " la table de connexions TCP en envoyant des milliers de SYN sans reponse."
+        },
+        {
+            "Logger paquets suspects",
+            "net.ipv4.conf.all.log_martians", "1", "0",
+            "Logue les paquets avec des adresses sources impossibles (adresses privees"
+            " venant de l'exterieur). Permet de detecter du spoofing d'adresse IP."
+        },
+        {
+            "Bloquer redirections ICMP (IPv6)",
+            "net.ipv6.conf.all.accept_redirects", "0", "1",
+            "Meme protection que IPv4 mais pour le trafic IPv6. Refuse les redirections"
+            " ICMP pouvant etre utilisees pour des attaques man-in-the-middle."
+        },
+        {
+            "Ignorer broadcast ping",
+            "net.ipv4.icmp_echo_ignore_broadcasts", "1", "0",
+            "Ignore les pings envoyes en broadcast. Empeche la machine d'etre utilisee"
+            " comme amplificateur dans une attaque DDoS de type Smurf."
+        },
+        {
+            "Desactiver IPv6 (si inutilise)",
+            "net.ipv6.conf.all.disable_ipv6", "1", "0",
+            "Desactive completement IPv6 si tu ne l'utilises pas. Reduit la surface"
+            " d'attaque en eliminant toute une famille de protocoles reseau."
+        },
+        {
+            "Desactiver IP forwarding",
+            "net.ipv4.ip_forward", "0", "1",
+            "Empeche la machine de router des paquets entre interfaces. A desactiver"
+            " si la machine n'est pas un routeur ou un VPN gateway."
+        },
+        {
+            "Protection TIME_WAIT TCP",
+            "net.ipv4.tcp_rfc1337", "1", "0",
+            "Protege contre le TIME_WAIT assassination. Un attaquant peut envoyer un"
+            " RST pour forcer la fermeture de connexions TCP actives (RFC 1337)."
+        },
+        {
+            "Ignorer erreurs ICMP invalides",
+            "net.ipv4.icmp_ignore_bogus_error_responses", "1", "0",
+            "Ignore les reponses d'erreur ICMP non conformes a la RFC 1122. Reduit"
+            " le spam logs et les attaques par erreur ICMP synthetique."
+        },
+        {
+            "Desactiver timestamps TCP",
+            "net.ipv4.tcp_timestamps", "0", "1",
+            "Desactive les timestamps TCP qui exposent l'uptime du systeme et"
+            " facilitent certaines attaques off-path et de fingerprinting reseau."
+        },
+    };
+}

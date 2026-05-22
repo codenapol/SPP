@@ -1,0 +1,22 @@
+# Compiled binary
+spp
+*.o
+*.out
+
+# Personal notes
+note -perso
+note*
+
+# Claude / project config
+claude.md
+regle.md
+.claude/
+
+# Build artifacts
+build/
+*.a
+*.so
+
+# OS
+.DS_Store
+Thumbs.db
