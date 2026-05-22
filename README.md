@@ -1,4 +1,4 @@
-# SPP — Système de Protection Patriote
+# SPP :
 
 > Outil de durcissement Linux avec interface TUI interactive, conçu pour Kali Linux et les distributions Debian/Ubuntu.
 
@@ -120,4 +120,4 @@ SPP modifie des paramètres système sensibles. Testez toujours dans un environn
 
 ## Licence
 
-MIT — voir [LICENSE](LICENSE)
+MIT : [LICENSE](LICENSE)
