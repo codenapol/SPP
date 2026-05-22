@@ -11,6 +11,7 @@
 #include "modules/SSH.hpp"
 #include "modules/SELinux.hpp"
 #include "modules/AppArmor.hpp"
+#include "modules/Namespaces.hpp"
 
 #include <string>
 #include <vector>
@@ -137,6 +138,16 @@ int main(int argc, char* argv[]) {
     );
     optionsContainer->Add(sshComp);
 
+    auto nsOpts = NamespacesSecurity::options();
+    std::vector<Flag> nsState(nsOpts.size());
+    for (size_t i = 0; i < nsOpts.size(); ++i)
+        nsState[i].on = NamespacesSecurity::isHardened(nsOpts[i]);
+
+    Components nsComps;
+    for (size_t i = 0; i < nsOpts.size(); ++i)
+        nsComps.push_back(makeOption(nsOpts[i].name, nsOpts[i].detail, &nsState[i].on));
+    for (auto& c : nsComps) optionsContainer->Add(c);
+
     bool selinuxPresent = SELinuxSecurity::isInstalled();
     bool aaPresent      = AppArmorSecurity::isInstalled();
 
@@ -187,14 +198,16 @@ int main(int argc, char* argv[]) {
     bool serviceEnabled = FileIntegrity::isServiceEnabled();
     std::vector<IntegrityResult> integrityResults;
     std::string integrityMsg;
-    bool integrityIsError = false;
+    bool integrityIsError  = false;
+    bool baselineTampered  = false;
 
     auto serviceCheckbox = Checkbox("Activer au demarrage", &serviceEnabled);
 
     auto baselineBtn = Button("[ Creer baseline ]", [&] {
         bool ok = FileIntegrity::generateBaseline();
         integrityIsError = !ok;
-        integrityMsg = ok ? "Baseline creee dans /var/lib/spp/"
+        baselineTampered = false;
+        integrityMsg = ok ? "Baseline creee et signee dans /var/lib/spp/"
                           : "Echec — lancez en sudo";
         if (ok) integrityResults = FileIntegrity::check();
     });
@@ -203,6 +216,13 @@ int main(int argc, char* argv[]) {
         if (!FileIntegrity::hasBaseline()) {
             integrityIsError = true;
             integrityMsg = "Aucune baseline — creez-en une d'abord";
+            return;
+        }
+        baselineTampered = FileIntegrity::isBaselineTampered();
+        if (baselineTampered) {
+            integrityIsError = true;
+            integrityMsg = "ALERTE : La baseline a ete falsifiee !";
+            integrityResults = FileIntegrity::check();
             return;
         }
         integrityResults = FileIntegrity::check();
@@ -234,7 +254,14 @@ int main(int argc, char* argv[]) {
         applyGroup(memOpts,     memOptState);
         applyGroup(netPerfOpts, netPerfState);
 
-        // Persistance : reconstruit /etc/sysctl.d/99-spp.conf avec les options actives
+        for (size_t i = 0; i < nsOpts.size(); ++i) {
+            bool success = nsState[i].on
+                ? NamespacesSecurity::apply(nsOpts[i])
+                : NamespacesSecurity::revert(nsOpts[i]);
+            success ? ++ok : ++fail;
+        }
+
+        // Persistance sysctl kernel : /etc/sysctl.d/99-spp.conf
         std::vector<std::pair<std::string,std::string>> persistEntries;
         auto collect = [&](const std::vector<SysctlOption>& opts, const std::vector<Flag>& states) {
             for (size_t i = 0; i < opts.size(); ++i)
@@ -247,6 +274,13 @@ int main(int argc, char* argv[]) {
         collect(memOpts,    memOptState);
         collect(netPerfOpts, netPerfState);
         KernelSecurity::writePersistenceConf(persistEntries) ? ++ok : ++fail;
+
+        // Persistance namespaces : /etc/sysctl.d/99-spp-ns.conf
+        std::vector<std::pair<std::string,std::string>> nsPersist;
+        for (size_t i = 0; i < nsOpts.size(); ++i)
+            if (nsState[i].on)
+                nsPersist.push_back({ nsOpts[i].key, nsOpts[i].hardened });
+        NamespacesSecurity::writePersistenceConf(nsPersist) ? ++ok : ++fail;
 
         DNSSecurity::applyDNSSEC(dnsState[0].on)    ? ++ok : ++fail;
         DNSSecurity::applyDNSOverTLS(dnsState[1].on) ? ++ok : ++fail;
@@ -306,6 +340,7 @@ int main(int argc, char* argv[]) {
         // Reflete la suppression dans l'interface
         trackerLevel    = (int)HostsBlocker::NONE;
         serviceEnabled  = false;
+        baselineTampered = false;
         integrityResults.clear();
         integrityMsg.clear();
         for (size_t i = 0; i < selinuxModeState.size(); ++i)
@@ -368,6 +403,9 @@ int main(int argc, char* argv[]) {
         optLines.push_back(separator());
         optLines.push_back(sectionHeader("SSH", Color::Red));
         optLines.push_back(sshComp->Render());
+        optLines.push_back(separator());
+        optLines.push_back(sectionHeader("NAMESPACES", Color::Magenta));
+        for (auto& c : nsComps) optLines.push_back(c->Render());
         if (selinuxPresent) {
             optLines.push_back(separator());
             optLines.push_back(sectionHeader("SELINUX", Color::Blue));
@@ -407,18 +445,29 @@ int main(int argc, char* argv[]) {
 
         if (!integrityResults.empty()) {
             intLines.push_back(separator());
+            if (baselineTampered) {
+                intLines.push_back(
+                    text(" BASELINE FALSIFIEE — RESULTATS NON FIABLES") | color(Color::Red) | bold
+                );
+                intLines.push_back(separator());
+            }
             for (const auto& r : integrityResults) {
                 std::string mark;
                 Color col;
-                switch (r.status) {
-                    case IntegrityResult::OK:          mark = " OK  "; col = Color::Green;  break;
-                    case IntegrityResult::MODIFIED:    mark = " MOD "; col = Color::Red;    break;
-                    case IntegrityResult::MISSING:     mark = " ABS "; col = Color::Red;    break;
-                    case IntegrityResult::NO_BASELINE: mark = "  ?  "; col = Color::Yellow; break;
+                if (baselineTampered) {
+                    mark = " ??? ";
+                    col  = Color::Red;
+                } else {
+                    switch (r.status) {
+                        case IntegrityResult::OK:          mark = " OK  "; col = Color::Green;  break;
+                        case IntegrityResult::MODIFIED:    mark = " MOD "; col = Color::Red;    break;
+                        case IntegrityResult::MISSING:     mark = " ABS "; col = Color::Red;    break;
+                        case IntegrityResult::NO_BASELINE: mark = "  ?  "; col = Color::Yellow; break;
+                    }
                 }
                 intLines.push_back(hbox({
                     text(mark) | color(col) | bold,
-                    text(r.label),
+                    text(r.label) | color(col),
                 }));
             }
         }

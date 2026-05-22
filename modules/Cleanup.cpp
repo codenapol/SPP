@@ -5,10 +5,12 @@
 #include "SSH.hpp"
 #include "SELinux.hpp"
 #include "AppArmor.hpp"
+#include "Namespaces.hpp"
 
 CleanupResult Cleanup::removeAllTraces() {
     CleanupResult r;
-    KernelSecurity::removePersistenceConf()  ? ++r.ok : ++r.fail;
+    KernelSecurity::removePersistenceConf()       ? ++r.ok : ++r.fail;
+    NamespacesSecurity::removePersistenceConf()   ? ++r.ok : ++r.fail;
     HostsBlocker::apply(HostsBlocker::NONE)  ? ++r.ok : ++r.fail;
     FileIntegrity::purge()                   ? ++r.ok : ++r.fail;
     SSHSecurity::revert()                    ? ++r.ok : ++r.fail;

@@ -20,6 +20,7 @@ public:
     static bool generateBaseline();
     static std::vector<IntegrityResult> check();
     static bool hasBaseline();
+    static bool isBaselineTampered();
     static bool isServiceEnabled();
     static bool enableService();
     static bool disableService();
@@ -32,6 +33,7 @@ private:
     static std::vector<std::pair<std::string,std::string>> loadBaseline();
 
     static const std::string BASELINE_PATH;
+    static const std::string SIG_PATH;
     static const std::string SERVICE_FILE;
     static const std::string WANTS_LINK;
 };

@@ -8,6 +8,7 @@
 #include <unistd.h>
 
 const std::string FileIntegrity::BASELINE_PATH = "/var/lib/spp/integrity.db";
+const std::string FileIntegrity::SIG_PATH      = "/var/lib/spp/integrity.db.sig";
 const std::string FileIntegrity::SERVICE_FILE  = "/etc/systemd/system/spp-integrity.service";
 const std::string FileIntegrity::WANTS_LINK    = "/etc/systemd/system/multi-user.target.wants/spp-integrity.service";
 
@@ -24,11 +25,9 @@ static const std::array<uint32_t, 64> K = {
 
 static uint32_t rotr(uint32_t x, int n) { return (x >> n) | (x << (32 - n)); }
 
-static std::string sha256bytes(const std::string& data) {
-    uint32_t h[8] = {
-        0x6a09e667,0xbb67ae85,0x3c6ef372,0xa54ff53a,
-        0x510e527f,0x9b05688c,0x1f83d9ab,0x5be0cd19,
-    };
+static void sha256compute(const std::string& data, uint32_t h[8]) {
+    h[0]=0x6a09e667; h[1]=0xbb67ae85; h[2]=0x3c6ef372; h[3]=0xa54ff53a;
+    h[4]=0x510e527f; h[5]=0x9b05688c; h[6]=0x1f83d9ab; h[7]=0x5be0cd19;
 
     std::string msg = data;
     uint64_t bits = (uint64_t)data.size() * 8;
@@ -60,11 +59,53 @@ static std::string sha256bytes(const std::string& data) {
         h[0]+=a; h[1]+=b; h[2]+=c; h[3]+=d;
         h[4]+=e; h[5]+=f; h[6]+=g; h[7]+=hh;
     }
+}
 
+// Returns raw 32-byte digest (needed for HMAC inner hash)
+static std::string sha256raw32(const std::string& data) {
+    uint32_t h[8];
+    sha256compute(data, h);
+    std::string out(32, '\0');
+    for (int i = 0; i < 8; ++i) {
+        out[i*4+0] = (char)((h[i] >> 24) & 0xff);
+        out[i*4+1] = (char)((h[i] >> 16) & 0xff);
+        out[i*4+2] = (char)((h[i] >>  8) & 0xff);
+        out[i*4+3] = (char)( h[i]        & 0xff);
+    }
+    return out;
+}
+
+static std::string sha256hex(const std::string& data) {
+    uint32_t h[8];
+    sha256compute(data, h);
     std::ostringstream oss;
     for (int i = 0; i < 8; ++i)
         oss << std::hex << std::setw(8) << std::setfill('0') << h[i];
     return oss.str();
+}
+
+// HMAC-SHA256 : lie la signature a cette machine via machine-id
+static std::string hmacSha256hex(const std::string& key, const std::string& data) {
+    std::string kp(64, '\0');
+    size_t klen = key.size() < 64 ? key.size() : 64;
+    for (size_t i = 0; i < klen; ++i) kp[i] = key[i];
+
+    std::string k_ipad = kp, k_opad = kp;
+    for (int i = 0; i < 64; ++i) {
+        k_ipad[i] ^= 0x36;
+        k_opad[i] ^= 0x5c;
+    }
+    return sha256hex(k_opad + sha256raw32(k_ipad + data));
+}
+
+static std::string machineKey() {
+    std::ifstream f("/etc/machine-id");
+    if (!f.is_open()) return "spp-fallback-key-00000000000000000000000000000000";
+    std::string id;
+    std::getline(f, id);
+    while (!id.empty() && (id.back() == '\r' || id.back() == ' '))
+        id.pop_back();
+    return id.empty() ? "spp-fallback-key-00000000000000000000000000000000" : id;
 }
 
 std::string FileIntegrity::sha256file(const std::string& path) {
@@ -73,18 +114,30 @@ std::string FileIntegrity::sha256file(const std::string& path) {
 
     std::ostringstream buf;
     buf << f.rdbuf();
-    return sha256bytes(buf.str());
+    return sha256hex(buf.str());
 }
 
 bool FileIntegrity::saveBaseline(const std::vector<std::pair<std::string,std::string>>& hashes) {
     mkdir("/var/lib/spp", 0700);
 
+    std::ostringstream content;
+    content << "# SPP-INTEGRITY-BASELINE\n";
+    for (const auto& [path, hash] : hashes)
+        content << path << ':' << hash << '\n';
+    std::string data = content.str();
+
     std::ofstream f(BASELINE_PATH);
     if (!f.is_open()) return false;
-    f << "# SPP-INTEGRITY-BASELINE\n";
-    for (const auto& [path, hash] : hashes)
-        f << path << ':' << hash << '\n';
-    return f.good();
+    f << data;
+    if (!f.good()) return false;
+    f.close();
+
+    // Signe le contenu avec HMAC-SHA256(machine-id) pour detecter toute falsification
+    std::string sig = hmacSha256hex(machineKey(), data);
+    std::ofstream sf(SIG_PATH);
+    if (!sf.is_open()) return false;
+    sf << sig << '\n';
+    return sf.good();
 }
 
 std::vector<std::pair<std::string,std::string>> FileIntegrity::loadBaseline() {
@@ -162,6 +215,27 @@ bool FileIntegrity::hasBaseline() {
     return stat(BASELINE_PATH.c_str(), &st) == 0;
 }
 
+bool FileIntegrity::isBaselineTampered() {
+    struct stat st;
+    // Pas de baseline = pas de falsification (juste absente)
+    if (stat(BASELINE_PATH.c_str(), &st) != 0) return false;
+    // Baseline presente mais signature absente = falsification
+    if (stat(SIG_PATH.c_str(), &st) != 0) return true;
+
+    std::ifstream bf(BASELINE_PATH);
+    if (!bf.is_open()) return true;
+    std::ostringstream buf;
+    buf << bf.rdbuf();
+    std::string content = buf.str();
+
+    std::ifstream sf(SIG_PATH);
+    if (!sf.is_open()) return true;
+    std::string stored;
+    std::getline(sf, stored);
+
+    return stored != hmacSha256hex(machineKey(), content);
+}
+
 bool FileIntegrity::isServiceEnabled() {
     struct stat st;
     return stat(WANTS_LINK.c_str(), &st) == 0;
@@ -180,6 +254,7 @@ bool FileIntegrity::disableService() {
 bool FileIntegrity::purge() {
     disableService();
     unlink(SERVICE_FILE.c_str());
+    unlink(SIG_PATH.c_str());
     unlink(BASELINE_PATH.c_str());
     rmdir("/var/lib/spp");
     return true;
