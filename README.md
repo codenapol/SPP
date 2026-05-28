@@ -59,12 +59,6 @@ g++ -std=c++17 -O2 \
     -o spp
 ```
 
-Ou avec CMake si un `CMakeLists.txt` est disponible :
-
-```bash
-cmake -B build && cmake --build build
-```
-
 ## Utilisation
 
 ```bash
