@@ -25,7 +25,7 @@ sudo ./spp
 3. **Configurer** l'intégrité de fichiers si nécessaire
 4. Cliquer **[ Appliquer ]** pour activer tous les changements
 
-## Panneau gauche — Options de sécurité
+## Panneau gauche Options de sécurité
 
 Chaque option affiche :
 - Son nom
@@ -33,7 +33,7 @@ Chaque option affiche :
 
 Les options cochées seront **activées**, les décochées seront **désactivées** lors de l'application.
 
-## Panneau droit — Trackers & Intégrité
+## Panneau droit Trackers & Intégrité
 
 ### Bloqueur de trackers
 
