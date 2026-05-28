@@ -8,9 +8,9 @@ Gère le durcissement via `sysctl`. Chaque option est un `SysctlOption` avec :
 - `hardened` / `defaults` : valeurs durcie et par défaut
 
 **Catégories exposées :**
-- `kernelOptions()` — protection mémoire noyau (ASLR, ptrace, kptr_restrict…)
-- `fsOptions()` — désactivation de systèmes de fichiers inutilisés
-- `netOptions()` — filtrage réseau (SYN cookies, ICMP, source routing)
+- `kernelOptions()`  protection mémoire noyau (ASLR, ptrace, kptr_restrict…)
+- `fsOptions()`  désactivation de systèmes de fichiers inutilisés
+- `netOptions()`  filtrage réseau (SYN cookies, ICMP, source routing)
 
 **Persistance** : `writePersistenceConf()` régénère `/etc/sysctl.d/99-spp.conf` avec uniquement les options actives.
 
@@ -20,8 +20,8 @@ Gère le durcissement via `sysctl`. Chaque option est un `SysctlOption` avec :
 
 Interface avec `systemd-resolved` via `/etc/systemd/resolved.conf`.
 
-- `applyDNSSEC(bool)` — active/désactive `DNSSEC=yes`
-- `applyDNSOverTLS(bool)` — active/désactive `DNSOverTLS=yes`
+- `applyDNSSEC(bool)`  active/désactive `DNSSEC=yes`
+- `applyDNSOverTLS(bool)`  active/désactive `DNSOverTLS=yes`
 
 Relance automatiquement `systemd-resolved` après modification.
 
@@ -60,8 +60,8 @@ Les entrées SPP sont encadrées par des marqueurs pour ne pas polluer le fichie
 
 Hérite de l'infrastructure `SysctlOption` du module Kernel.
 
-- `memoryOptions()` — `vm.swappiness`, dirty ratios, huge pages
-- `networkOptions()` — BBR congestion control, buffers TCP, `net.core.somaxconn`
+- `memoryOptions()`  `vm.swappiness`, dirty ratios, huge pages
+- `networkOptions()`  BBR congestion control, buffers TCP, `net.core.somaxconn`
 
 ---
 
