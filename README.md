@@ -10,21 +10,6 @@
 
 SPP est un outil en ligne de commande (TUI) qui centralise les opérations de durcissement de sécurité Linux. Il permet d'appliquer, de surveiller et de restaurer des configurations de sécurité depuis une interface unifiée sans avoir à jongler entre de multiples fichiers de configuration système.
 
-```
-┌─ SPP — Système de Protection Patriote ──────────────────────────────┐
-│                                                                      │
-│  KERNEL          │  BLOQUEUR DE TRACKERS                            │
-│  ├─ [x] ASLR     │  ○ Aucune                                        │
-│  ├─ [x] ...      │  ● Minimum  —  19 domaines                       │
-│                  │  ○ Basique  —  79 domaines                       │
-│  DNS             │  ○ Hard     — 156 domaines                       │
-│  ├─ [x] DNSSEC   │                                                  │
-│  └─ [x] DoT      │  INTÉGRITÉ FICHIERS                              │
-│                  │  [ Créer baseline ]  [ Vérifier ]                │
-│  [ Appliquer ]   [ Supprimer SPP ]   [ Quitter ]                    │
-└──────────────────────────────────────────────────────────────────────┘
-```
-
 ## Fonctionnalités
 
 | Module | Description |
