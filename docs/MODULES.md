@@ -47,7 +47,7 @@ Modifie `/etc/hosts` pour bloquer des domaines de tracking.
 **Niveaux :**
 | Niveau | Domaines |
 |--------|----------|
-| `NONE` | 0 — restaure l'état original |
+| `NONE` | 0  restaure l'état original |
 | `MINIMUM` | 19 |
 | `BASIQUE` | 79 |
 | `HARD` | 156 |
@@ -69,7 +69,7 @@ Hérite de l'infrastructure `SysctlOption` du module Kernel.
 
 Modifie `/etc/ssh/sshd_config`.
 
-- `applyDisableRootLogin(bool)` — ajoute ou supprime `PermitRootLogin no`
+- `applyDisableRootLogin(bool)`  ajoute ou supprime `PermitRootLogin no`
 - Relance `sshd` via `systemctl restart sshd`
 
 ---
@@ -78,8 +78,8 @@ Modifie `/etc/ssh/sshd_config`.
 
 Disponible uniquement si SELinux est installé (`isInstalled()` vérifie la présence des binaires).
 
-- `modeOptions()` — basculer en mode `enforcing`
-- `booleanOptions()` — booleans SELinux courants (ex: `httpd_can_network_connect`)
+- `modeOptions()`  basculer en mode `enforcing`
+- `booleanOptions()`  booleans SELinux courants (ex: `httpd_can_network_connect`)
 - Applique via `/proc/sys/fs/selinux/` et `setsebool`
 
 ---
@@ -88,8 +88,8 @@ Disponible uniquement si SELinux est installé (`isInstalled()` vérifie la pré
 
 Disponible uniquement si AppArmor est installé.
 
-- `enforcementOptions()` — activer `enforce_all`
-- `profileOptions()` — passer des profils individuels en mode `enforce`
+- `enforcementOptions()`  activer `enforce_all`
+- `profileOptions()`  passer des profils individuels en mode `enforce`
 - Lit/écrit dans `/sys/kernel/security/apparmor/` et les fichiers de profils
 
 ---
