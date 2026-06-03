@@ -1,6 +1,6 @@
 # SPP :
 
-> Outil de durcissement Linux avec interface TUI interactive, conçu pour Kali Linux et les distributions Debian/Ubuntu.
+> Outil de durcissement Linux avec interface TUI interactive, conçu pour et sur Kali Linux mais utilisable sur les distributions Debian/Ubuntu.
 
 ![C++](https://img.shields.io/badge/C%2B%2B-17-blue)
 ![Platform](https://img.shields.io/badge/platform-Linux-lightgrey)
@@ -8,7 +8,7 @@
 
 ## Aperçu
 
-SPP est un outil en ligne de commande (TUI) qui centralise les opérations de durcissement de sécurité Linux. Il permet d'appliquer, de surveiller et de restaurer des configurations de sécurité depuis une interface unifiée sans avoir à jongler entre de multiples fichiers de configuration système.
+SPP est un outil en ligne de commande (TUI) qui centralise les opérations de durcissement de sécurité Linux. Il permet d'appliquer, de surveiller et de restaurer des configurations de sécurité depuis une interface unifiée sans avoir à jongler entre de multiples fichiers de configuration système (Il permet aussi d'activé des option recommandé par l'ANSSI : https://messervices.cyber.gouv.fr/documents-guides/fr_np_linux_configuration-v2.0.pdf).
 
 ## Fonctionnalités
 
@@ -62,10 +62,10 @@ g++ -std=c++17 -O2 \
 ## Utilisation
 
 ```bash
-# Interface graphique interactive
+# Pour run SPP
 sudo ./spp
 
-# Vérification d'intégrité en mode non-interactif (pour cron/systemd)
+# Vérification d'intégrité en mode non-interactif
 sudo ./spp --check
 # Retourne 0 si tout est OK, 1 si anomalie détectée
 ```
