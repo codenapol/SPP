@@ -1,4 +1,4 @@
-# SPP :
+# SPP 
 
 > Outil de durcissement Linux avec interface TUI interactive, conçu pour et sur Kali Linux mais utilisable sur les distributions Debian/Ubuntu.
 
@@ -7,8 +7,13 @@
 ![License](https://img.shields.io/badge/license-MIT-green)
 
 ## Aperçu
+SPP est un outil en ligne de commande (TUI) qui centralise les opérations de
+durcissement de sécurité Linux. Il permet d'appliquer, de surveiller et de
+restaurer des configurations de sécurité depuis une interface unifiée, sans
+avoir à jongler entre de multiples fichiers de configuration système.
 
-SPP est un outil en ligne de commande (TUI) qui centralise les opérations de durcissement de sécurité Linux. Il permet d'appliquer, de surveiller et de restaurer des configurations de sécurité depuis une interface unifiée sans avoir à jongler entre de multiples fichiers de configuration système (Il permet aussi d'activé des option recommandé par l'ANSSI : https://messervices.cyber.gouv.fr/documents-guides/fr_np_linux_configuration-v2.0.pdf).
+Les options proposées suivent les recommandations du
+[guide ANSSI de configuration Linux (v2.0)](https://messervices.cyber.gouv.fr/documents-guides/fr_np_linux_configuration-v2.0.pdf).
 
 ## Fonctionnalités
 
@@ -21,10 +26,11 @@ SPP est un outil en ligne de commande (TUI) qui centralise les opérations de du
 | **Mémoire** | Optimisation vm.swappiness, paramètres huge pages |
 | **Perf réseau** | BBR, paramètres TCP avancés |
 | **SSH** | Désactivation du login root via SSH |
+| **Namespaces** | Restriction des user namespaces non privilégiés |
 | **SELinux** | Mode enforcing + booleans (si SELinux installé) |
 | **AppArmor** | Profils enforce (si AppArmor installé) |
 | **Hosts Blocker** | Blocage de trackers via /etc/hosts (3 niveaux : 19 / 79 / 156 domaines) |
-| **File Integrity** | Baseline SHA-256 + vérification + service systemd au démarrage |
+| **File Integrity** | Baseline SHA-256 signée en HMAC-SHA256 + vérification + service systemd au démarrage |
 | **Cleanup** | Suppression complète de toutes les traces SPP |
 
 ## Prérequis
@@ -55,6 +61,7 @@ g++ -std=c++17 -O2 \
     modules/SSH.cpp \
     modules/SELinux.cpp \
     modules/AppArmor.cpp \
+    modules/Namespaces.cpp \
     -lftxui-component -lftxui-dom -lftxui-screen \
     -o spp
 ```
@@ -90,7 +97,8 @@ SPP/
     ├── Cleanup.cpp/.hpp        # Suppression des traces
     ├── SSH.cpp/.hpp            # Sécurité SSH
     ├── SELinux.cpp/.hpp        # Gestion SELinux
-    └── AppArmor.cpp/.hpp       # Gestion AppArmor
+    ├── AppArmor.cpp/.hpp       # Gestion AppArmor
+    └── Namespaces.cpp/.hpp     # Isolation user namespaces
 ```
 
 ## Avertissement
