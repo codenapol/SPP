@@ -28,7 +28,7 @@ cliquer sur Appliquer ne change strictement rien au système et affiche
 « Aucun changement à appliquer ».
 
 Après application, l'interface relit l'état réel du système. **Une case qui se
-recoche toute seule signale que l'opération n'a pas abouti** — profil AppArmor
+recoche toute seule signale que l'opération n'a pas abouti** profil AppArmor
 absent, boolean SELinux inconnu de la politique, etc.
 
 Décocher une option que SPP n'a jamais activée ne fait rien non plus : le réglage
@@ -46,7 +46,7 @@ Les sections dont aucune option n'est applicable sur votre machine **ne
 s'affichent pas** : module absent, clé sysctl inexistante sur votre noyau,
 profil AppArmor non installé.
 
-## Panneau droit — Trackers & Intégrité
+## Panneau droit : Trackers & Intégrité
 
 ### Bloqueur de trackers
 
