@@ -71,7 +71,7 @@ Codes de sortie de `--check` :
 |------|---------------|
 | 0 | Aucune anomalie (ou aucune baseline définie) |
 | 1 | Fichier modifié ou absent |
-| 2 | **Baseline falsifiée** — résultats non fiables |
+| 2 | **Baseline falsifiée**  résultats non fiables |
 | 3 | Erreur d'usage (droits insuffisants, option inconnue) |
 
 ## Désinstallation
