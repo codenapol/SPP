@@ -16,6 +16,10 @@ public:
     static std::vector<SELinuxOption> modeOptions();
     static std::vector<SELinuxOption> booleanOptions();
 
+    // Ecarte les booleans absents de la politique chargee (deny_ptrace et
+    // secure_mode_* n'existent pas partout) : setsebool y echouerait.
+    static std::vector<SELinuxOption> available(const std::vector<SELinuxOption>& opts);
+
     static bool isHardened(const SELinuxOption& opt);
     static bool apply(const SELinuxOption& opt);
     static bool revert(const SELinuxOption& opt);

@@ -34,6 +34,9 @@ private:
 
     static const std::string BASELINE_PATH;
     static const std::string SIG_PATH;
+    static const std::string KEY_PATH;      // cle de signature, root uniquement
     static const std::string SERVICE_FILE;
-    static const std::string WANTS_LINK;
+    static const std::string TIMER_FILE;
+    static const std::string TIMER_LINK;
+    static const std::string WANTS_LINK;    // ancien lien pose a la main, purge seulement
 };

@@ -17,6 +17,10 @@ public:
     static std::vector<AppArmorOption> enforcementOptions();
     static std::vector<AppArmorOption> profileOptions();
 
+    // Ecarte les profils absents de /etc/apparmor.d/ : ils ne peuvent pas etre
+    // appliques et n'ont donc rien a faire dans l'interface.
+    static std::vector<AppArmorOption> available(const std::vector<AppArmorOption>& opts);
+
     static bool isHardened(const AppArmorOption& opt);
     static bool apply(const AppArmorOption& opt);
     static bool revert(const AppArmorOption& opt);

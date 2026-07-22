@@ -1,5 +1,7 @@
 #include "SELinux.hpp"
+#include "SafeFile.hpp"
 #include <fstream>
+#include <sstream>
 #include <string>
 #include <vector>
 #include <cstdlib>
@@ -56,10 +58,9 @@ bool SELinuxSecurity::writeMode(bool enforcing) {
 
     if (!found) return rt == 0;
 
-    std::ofstream fout(CONFIG_PATH);
-    if (!fout.is_open()) return rt == 0;
-    for (const auto& l : lines) fout << l << '\n';
-    return fout.good();
+    std::ostringstream out;
+    for (const auto& l : lines) out << l << '\n';
+    return SafeFile::writeAtomic(CONFIG_PATH, out.str());
 }
 
 // ─── booleans setsebool ───────────────────────────────────────────────────────
@@ -99,6 +100,15 @@ bool SELinuxSecurity::apply(const SELinuxOption& opt) {
 bool SELinuxSecurity::revert(const SELinuxOption& opt) {
     if (opt.key == "mode") return writeMode(!opt.hardenedOn);
     return writeBool(opt.key, !opt.hardenedOn);
+}
+
+std::vector<SELinuxOption> SELinuxSecurity::available(const std::vector<SELinuxOption>& opts) {
+    std::vector<SELinuxOption> out;
+    for (const auto& opt : opts) {
+        if (opt.key == "mode" || SafeFile::exists(BOOL_DIR + opt.key))
+            out.push_back(opt);
+    }
+    return out;
 }
 
 // ─── listes d'options ─────────────────────────────────────────────────────────

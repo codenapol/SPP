@@ -1,4 +1,5 @@
 #include "HostsBlocker.hpp"
+#include "SafeFile.hpp"
 #include <fstream>
 #include <sstream>
 
@@ -21,10 +22,13 @@ HostsBlocker::Level HostsBlocker::currentLevel() {
 }
 
 bool HostsBlocker::apply(Level level) {
-    std::ifstream in(HOSTS_PATH);
-    if (!in.is_open()) return false;
+    const std::string current = SafeFile::read(HOSTS_PATH);
+    if (current.empty()) return false;
+
+    SafeFile::backupOnce(HOSTS_PATH);
 
     std::vector<std::string> preserved;
+    std::istringstream in(current);
     std::string line;
     bool inBlock = false;
 
@@ -34,11 +38,18 @@ bool HostsBlocker::apply(Level level) {
         if (!inBlock)
             preserved.push_back(line);
     }
-    in.close();
 
-    std::ofstream out(HOSTS_PATH);
-    if (!out.is_open()) return false;
+    // Marqueur d'ouverture sans fermeture : le fichier a ete tronque par une
+    // interruption anterieure. Poursuivre reviendrait a effacer tout ce qui
+    // suit -- y compris la resolution de localhost.
+    if (inBlock) return false;
 
+    // Le bloc est precede d'une ligne vide, elle-meme conservee a la relecture :
+    // sans cette normalisation, chaque application en ajoutait une de plus.
+    while (!preserved.empty() && SafeFile::trim(preserved.back()).empty())
+        preserved.pop_back();
+
+    std::ostringstream out;
     for (const auto& l : preserved)
         out << l << '\n';
 
@@ -49,7 +60,9 @@ bool HostsBlocker::apply(Level level) {
         out << MARKER_END << '\n';
     }
 
-    return out.good();
+    // Ecriture atomique : /etc/hosts est le fichier le plus expose ici, une
+    // coupure en pleine troncature couperait la machine de localhost.
+    return SafeFile::writeAtomic(HOSTS_PATH, out.str());
 }
 
 std::vector<std::string> HostsBlocker::domainsFor(Level level) {
@@ -121,7 +134,6 @@ std::vector<std::string> HostsBlocker::basiqueDomains() {
         "zemanta.com",
         "ads.twitter.com",
         "analytics.twitter.com",
-        "t.co",
         "ct.pinterest.com",
         "trk.pinterest.com",
         "tr.snapchat.com",
@@ -157,6 +169,9 @@ std::vector<std::string> HostsBlocker::basiqueDomains() {
 
 std::vector<std::string> HostsBlocker::hardDomains() {
     return {
+        // Raccourcisseur de liens de Twitter/X : le bloquer casse TOUS les liens
+        // t.co, y compris hors navigateur. Sa place est ici, pas en BASIQUE.
+        "t.co",
         "fullstory.com",
         "rs.fullstory.com",
         "edge.fullstory.com",
@@ -256,7 +271,7 @@ std::string HostsBlocker::levelDescription(Level level) {
                    "DoubleClick, Facebook Pixel, Hotjar, Mouseflow.\n"
                    "Faux positifs : aucun. Niveau recommande pour debuter.";
         case BASIQUE:
-            return "Bloque 79 domaines (inclut Minimum) : pixels Twitter,\n"
+            return "Bloque 78 domaines (inclut Minimum) : pixels Twitter,\n"
                    "Pinterest, TikTok, Snap, Adobe Analytics, Microsoft\n"
                    "Clarity, Criteo, Outbrain, Taboola, Mixpanel, Amplitude.\n"
                    "Sites fonctionnent normalement. Faux positifs : quasi nuls.";
@@ -264,7 +279,8 @@ std::string HostsBlocker::levelDescription(Level level) {
             return "Bloque 156 domaines (inclut Basique) : session recording\n"
                    "(FullStory, LogRocket, CrazyEgg), DMP (LiveRamp, Lotame,\n"
                    "Bluekai), DSP (TradeDesk, MediaMath), Sentry, Bugsnag.\n"
-                   "Peut casser certains chats live (Intercom, Drift).";
+                   "Casse les liens t.co (Twitter/X) et les chats live\n"
+                   "(Intercom, Drift), ainsi que la remontee d'erreurs.";
     }
     return "";
 }

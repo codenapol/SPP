@@ -1,66 +1,112 @@
 #include "DNS.hpp"
-#include <fstream>
-#include <string>
-#include <vector>
+#include "SafeFile.hpp"
 
-static const char* CONF = "/etc/systemd/resolved.conf";
+#include <sstream>
+#include <vector>
+#include <cstdlib>
+
+static const std::string CONF = "/etc/systemd/resolved.conf";
+
+// Un en-tete de section peut porter des espaces : "[Resolve] " doit compter.
+static bool isSection(const std::string& line, const char* name) {
+    const std::string t = SafeFile::trim(line);
+    return t == name;
+}
+
+static bool isAnySection(const std::string& line) {
+    const std::string t = SafeFile::trim(line);
+    return !t.empty() && t[0] == '[';
+}
+
+bool DNSSecurity::isAvailable() {
+    if (!SafeFile::exists(CONF)) return false;
+    // "unknown" = unite inconnue de systemd ; tout le reste (active, inactive,
+    // masked...) signifie que resolved existe et peut etre configure.
+    return std::system("systemctl cat systemd-resolved >/dev/null 2>&1") == 0;
+}
 
 std::string DNSSecurity::readKey(const std::string& key) {
-    std::ifstream f(CONF);
-    if (!f.is_open()) return "";
+    std::istringstream in(SafeFile::read(CONF));
     std::string line;
     bool inResolve = false;
-    while (std::getline(f, line)) {
-        if (line == "[Resolve]") { inResolve = true; continue; }
+
+    while (std::getline(in, line)) {
+        if (isSection(line, "[Resolve]")) { inResolve = true; continue; }
         if (!inResolve) continue;
-        if (!line.empty() && line[0] == '[') break;
-        if (line.rfind(key + "=", 0) == 0)
-            return line.substr(key.size() + 1);
+        if (isAnySection(line)) break;
+
+        const std::string t = SafeFile::trim(line);
+        if (t.empty() || t[0] == '#') continue;
+
+        const auto eq = t.find('=');
+        if (eq == std::string::npos) continue;
+        // Tolere "DNSSEC = yes" comme "DNSSEC=yes".
+        if (SafeFile::trim(t.substr(0, eq)) == key)
+            return SafeFile::trim(t.substr(eq + 1));
     }
     return "";
 }
 
 bool DNSSecurity::writeKey(const std::string& key, const std::string& value) {
-    std::ifstream fin(CONF);
-    if (!fin.is_open()) return false;
-    std::vector<std::string> lines;
-    std::string line;
-    while (std::getline(fin, line))
-        lines.push_back(line);
-    fin.close();
+    if (!SafeFile::exists(CONF)) return false;
+    SafeFile::backupOnce(CONF);
 
+    std::vector<std::string> lines;
+    {
+        std::istringstream in(SafeFile::read(CONF));
+        std::string line;
+        while (std::getline(in, line)) lines.push_back(line);
+    }
+
+    const std::string entry = key + "=" + value;
     bool inResolve = false;
-    bool found = false;
-    for (auto& l : lines) {
-        if (l == "[Resolve]") { inResolve = true; continue; }
-        if (inResolve && !l.empty() && l[0] == '[') inResolve = false;
-        if (!inResolve) continue;
-        size_t s = 0;
-        while (s < l.size() && (l[s] == '#' || l[s] == ' ')) ++s;
-        if (l.substr(s).rfind(key + "=", 0) == 0) {
-            l = key + "=" + value;
-            found = true;
+    bool found     = false;
+    size_t sectionAt = std::string::npos;
+
+    for (size_t i = 0; i < lines.size(); ++i) {
+        if (isSection(lines[i], "[Resolve]")) {
+            inResolve = true;
+            sectionAt = i;
+            continue;
         }
+        if (inResolve && isAnySection(lines[i])) inResolve = false;
+        if (!inResolve) continue;
+
+        // Rattrape aussi la ligne commentee que livrent les distributions.
+        std::string t = SafeFile::trim(lines[i]);
+        while (!t.empty() && (t[0] == '#' || t[0] == ' ')) t = SafeFile::trim(t.substr(1));
+
+        const auto eq = t.find('=');
+        if (eq == std::string::npos) continue;
+        if (SafeFile::trim(t.substr(0, eq)) != key) continue;
+
+        lines[i] = found ? ("#" + lines[i]) : entry;
+        found = true;
     }
 
     if (!found) {
-        for (size_t i = 0; i < lines.size(); ++i) {
-            if (lines[i] == "[Resolve]") {
-                lines.insert(lines.begin() + i + 1, key + "=" + value);
-                found = true;
-                break;
-            }
-        }
+        if (sectionAt != std::string::npos)
+            lines.insert(lines.begin() + static_cast<long>(sectionAt) + 1, entry);
+        else
+            lines.insert(lines.end(), { "[Resolve]", entry });  // section absente : la creer
     }
 
-    if (!found) return false;
-    std::ofstream fout(CONF);
-    if (!fout.is_open()) return false;
-    for (const auto& l : lines) fout << l << '\n';
-    return fout.good();
+    std::ostringstream out;
+    for (const auto& l : lines) out << l << '\n';
+    if (!SafeFile::writeAtomic(CONF, out.str())) return false;
+
+    return reloadResolved();
 }
 
-bool DNSSecurity::isDNSSECEnabled()      { return readKey("DNSSEC")     == "yes"; }
-bool DNSSecurity::isDNSOverTLSEnabled()  { return readKey("DNSOverTLS") == "yes"; }
-bool DNSSecurity::applyDNSSEC(bool e)    { return writeKey("DNSSEC",     e ? "yes" : "no"); }
-bool DNSSecurity::applyDNSOverTLS(bool e){ return writeKey("DNSOverTLS", e ? "yes" : "no"); }
+// Sans ce rechargement, la modification n'avait aucun effet avant le prochain
+// redemarrage -- alors que la documentation du projet l'annonçait deja.
+bool DNSSecurity::reloadResolved() {
+    if (std::system("systemctl is-active --quiet systemd-resolved 2>/dev/null") != 0)
+        return true;  // pas demarre : rien a recharger, la conf servira au boot
+    return std::system("systemctl reload-or-restart systemd-resolved 2>/dev/null") == 0;
+}
+
+bool DNSSecurity::isDNSSECEnabled()       { return readKey("DNSSEC")     == "yes"; }
+bool DNSSecurity::isDNSOverTLSEnabled()   { return readKey("DNSOverTLS") == "yes"; }
+bool DNSSecurity::applyDNSSEC(bool e)     { return writeKey("DNSSEC",     e ? "yes" : "no"); }
+bool DNSSecurity::applyDNSOverTLS(bool e) { return writeKey("DNSOverTLS", e ? "yes" : "no"); }

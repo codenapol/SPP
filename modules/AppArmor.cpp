@@ -1,4 +1,5 @@
 #include "AppArmor.hpp"
+#include "SafeFile.hpp"
 #include <fstream>
 #include <string>
 #include <vector>
@@ -35,9 +36,11 @@ bool AppArmorSecurity::readEnforceAll() {
 }
 
 bool AppArmorSecurity::writeEnforceAll(bool enforce) {
-    std::string cmd = enforce
-        ? "aa-enforce /etc/apparmor.d/* 2>/dev/null"
-        : "aa-complain /etc/apparmor.d/* 2>/dev/null";
+    // Le glob /etc/apparmor.d/* remontait aussi abstractions/, tunables/ et
+    // local/ : aa-enforce sortait en erreur, l'operation echouait toujours.
+    std::string cmd = std::string("find /etc/apparmor.d -maxdepth 1 -type f -exec ")
+                    + (enforce ? "aa-enforce" : "aa-complain")
+                    + " {} + >/dev/null 2>&1";
     return system(cmd.c_str()) == 0;
 }
 
@@ -86,6 +89,18 @@ bool AppArmorSecurity::apply(const AppArmorOption& opt) {
 bool AppArmorSecurity::revert(const AppArmorOption& opt) {
     if (opt.key == "enforce_all") return writeEnforceAll(!opt.hardenedOn);
     return writeProfile(opt.key, !opt.hardenedOn);
+}
+
+// Les profils listes ici ne sont pas tous installes : sbin.dhclient n'existe
+// pas sur un systeme merged-/usr, usr.bin.firefox pas sur Debian. Les afficher
+// produisait des echecs pour des profils simplement absents.
+std::vector<AppArmorOption> AppArmorSecurity::available(const std::vector<AppArmorOption>& opts) {
+    std::vector<AppArmorOption> out;
+    for (const auto& opt : opts) {
+        if (opt.key == "enforce_all" || SafeFile::exists(PROFILES_DIR + opt.key))
+            out.push_back(opt);
+    }
+    return out;
 }
 
 // ─── listes d'options ─────────────────────────────────────────────────────────

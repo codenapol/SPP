@@ -32,42 +32,61 @@ sudo apt install g++ cmake build-essential
 git clone https://github.com/codenapol/SPP.git
 cd SPP
 
-g++ -std=c++17 -O2 \
-    main.cpp \
-    modules/Kernel.cpp \
-    modules/DNS.cpp \
-    modules/FileIntegrity.cpp \
-    modules/HostsBlocker.cpp \
-    modules/Optimization.cpp \
-    modules/Cleanup.cpp \
-    modules/SSH.cpp \
-    modules/SELinux.cpp \
-    modules/AppArmor.cpp \
-    -lftxui-component -lftxui-dom -lftxui-screen \
-    -o spp
+cmake -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build -j
 ```
 
-## Installation système (optionnel)
-
-Pour rendre `spp` accessible depuis n'importe où :
+Le binaire est produit dans `build/spp`. La compilation en `Release` active
+`-D_FORTIFY_SOURCE=2`, `-fstack-protector-strong`, PIE et RELRO complet : un
+outil de durcissement qui tourne en root doit lui-même être durci.
 
 ```bash
-sudo cp spp /usr/local/bin/spp
-sudo chmod 755 /usr/local/bin/spp
+checksec --file=build/spp    # verification facultative
 ```
 
-## Vérification
+## Installation système (recommandé)
 
 ```bash
-./spp --check
-# Doit retourner 0 (pas d'anomalie) si aucune baseline n'est définie
+sudo cmake --install build --prefix /usr/local
 ```
+
+Le contrôle d'intégrité périodique référence le binaire par son chemin réel.
+Installer SPP à demeure avant d'activer ce contrôle évite une unité systemd
+pointant vers un répertoire de compilation.
+
+## Utilisation
+
+SPP **exige les droits root** : sans eux l'interface afficherait un état faux,
+toutes les lectures de `/etc` échouant.
+
+```bash
+sudo spp            # interface de durcissement
+sudo spp --check    # controle d'integrite
+sudo spp --help
+```
+
+Codes de sortie de `--check` :
+
+| Code | Signification |
+|------|---------------|
+| 0 | Aucune anomalie (ou aucune baseline définie) |
+| 1 | Fichier modifié ou absent |
+| 2 | **Baseline falsifiée** — résultats non fiables |
+| 3 | Erreur d'usage (droits insuffisants, option inconnue) |
 
 ## Désinstallation
 
-Depuis l'interface SPP, utilisez le bouton **Supprimer SPP** qui :
-- Supprime la configuration sysctl persistante (`/etc/sysctl.d/99-spp.conf`)
-- Désactive et supprime le service systemd d'intégrité
-- Restaure `/etc/hosts` à son état d'origine
-- Restaure `sshd_config`
-- Supprime la baseline (`/var/lib/spp/`)
+Depuis l'interface, le bouton **Supprimer SPP** (une confirmation est demandée) :
+
+- Restaure chaque valeur sysctl telle qu'elle était avant la première intervention
+- Supprime `/etc/sysctl.d/99-spp.conf` et `99-spp-ns.conf`
+- Restaure `/etc/hosts`
+- Retire le drop-in `/etc/ssh/sshd_config.d/99-spp.conf`
+- Supprime la baseline, sa clé, l'unité et le timer (`/var/lib/spp/`)
+
+Il **ne touche ni à SELinux ni à AppArmor** : désinstaller SPP ne doit pas
+désactiver un confinement que SPP n'a pas mis en place.
+
+```bash
+sudo rm /usr/local/bin/spp     # retrait du binaire
+```

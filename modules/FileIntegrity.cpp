@@ -1,15 +1,23 @@
 #include "FileIntegrity.hpp"
+#include "SafeFile.hpp"
+
 #include <fstream>
 #include <sstream>
 #include <iomanip>
 #include <cstdint>
+#include <cstdlib>
+#include <cerrno>
+#include <climits>
 #include <array>
 #include <sys/stat.h>
 #include <unistd.h>
 
 const std::string FileIntegrity::BASELINE_PATH = "/var/lib/spp/integrity.db";
 const std::string FileIntegrity::SIG_PATH      = "/var/lib/spp/integrity.db.sig";
+const std::string FileIntegrity::KEY_PATH      = "/var/lib/spp/hmac.key";
 const std::string FileIntegrity::SERVICE_FILE  = "/etc/systemd/system/spp-integrity.service";
+const std::string FileIntegrity::TIMER_FILE    = "/etc/systemd/system/spp-integrity.timer";
+const std::string FileIntegrity::TIMER_LINK    = "/etc/systemd/system/timers.target.wants/spp-integrity.timer";
 const std::string FileIntegrity::WANTS_LINK    = "/etc/systemd/system/multi-user.target.wants/spp-integrity.service";
 
 static const std::array<uint32_t, 64> K = {
@@ -84,11 +92,12 @@ static std::string sha256hex(const std::string& data) {
     return oss.str();
 }
 
-// HMAC-SHA256 : lie la signature a cette machine via machine-id
 static std::string hmacSha256hex(const std::string& key, const std::string& data) {
+    // RFC 2104 : une cle plus longue qu'un bloc est hachee, jamais tronquee.
+    const std::string k = (key.size() > 64) ? sha256raw32(key) : key;
+
     std::string kp(64, '\0');
-    size_t klen = key.size() < 64 ? key.size() : 64;
-    for (size_t i = 0; i < klen; ++i) kp[i] = key[i];
+    for (size_t i = 0; i < k.size(); ++i) kp[i] = k[i];
 
     std::string k_ipad = kp, k_opad = kp;
     for (int i = 0; i < 64; ++i) {
@@ -98,14 +107,23 @@ static std::string hmacSha256hex(const std::string& key, const std::string& data
     return sha256hex(k_opad + sha256raw32(k_ipad + data));
 }
 
-static std::string machineKey() {
-    std::ifstream f("/etc/machine-id");
-    if (!f.is_open()) return "spp-fallback-key-00000000000000000000000000000000";
-    std::string id;
-    std::getline(f, id);
-    while (!id.empty() && (id.back() == '\r' || id.back() == ' '))
-        id.pop_back();
-    return id.empty() ? "spp-fallback-key-00000000000000000000000000000000" : id;
+// Cle de signature propre a l'installation, creee a la volee et lisible du seul
+// root. L'ancienne cle etait /etc/machine-id, en 0444 : n'importe quel
+// utilisateur pouvait recalculer une signature valide apres avoir maquille la
+// baseline. La signature n'authentifiait donc rien.
+static std::string integrityKey(const std::string& keyPath) {
+    const std::string existing = SafeFile::read(keyPath);
+    if (existing.size() == 32) return existing;
+
+    std::ifstream urandom("/dev/urandom", std::ios::binary);
+    if (!urandom.is_open()) return "";
+    std::string raw(32, '\0');
+    urandom.read(&raw[0], 32);
+    if (urandom.gcount() != 32) return "";
+
+    if (::mkdir("/var/lib/spp", 0700) != 0 && errno != EEXIST) return "";
+    if (!SafeFile::writeAtomic(keyPath, raw, 0600)) return "";
+    return raw;
 }
 
 std::string FileIntegrity::sha256file(const std::string& path) {
@@ -118,26 +136,20 @@ std::string FileIntegrity::sha256file(const std::string& path) {
 }
 
 bool FileIntegrity::saveBaseline(const std::vector<std::pair<std::string,std::string>>& hashes) {
-    mkdir("/var/lib/spp", 0700);
+    if (::mkdir("/var/lib/spp", 0700) != 0 && errno != EEXIST) return false;
+
+    const std::string key = integrityKey(KEY_PATH);
+    if (key.empty()) return false;  // sans cle, une baseline non signee ne vaut rien
 
     std::ostringstream content;
     content << "# SPP-INTEGRITY-BASELINE\n";
     for (const auto& [path, hash] : hashes)
         content << path << ':' << hash << '\n';
-    std::string data = content.str();
+    const std::string data = content.str();
 
-    std::ofstream f(BASELINE_PATH);
-    if (!f.is_open()) return false;
-    f << data;
-    if (!f.good()) return false;
-    f.close();
-
-    // Signe le contenu avec HMAC-SHA256(machine-id) pour detecter toute falsification
-    std::string sig = hmacSha256hex(machineKey(), data);
-    std::ofstream sf(SIG_PATH);
-    if (!sf.is_open()) return false;
-    sf << sig << '\n';
-    return sf.good();
+    // 0600 : la baseline revele quels fichiers sont surveilles.
+    if (!SafeFile::writeAtomic(BASELINE_PATH, data, 0600)) return false;
+    return SafeFile::writeAtomic(SIG_PATH, hmacSha256hex(key, data) + "\n", 0600);
 }
 
 std::vector<std::pair<std::string,std::string>> FileIntegrity::loadBaseline() {
@@ -171,11 +183,17 @@ std::vector<FileEntry> FileIntegrity::criticalFiles() {
 bool FileIntegrity::generateBaseline() {
     std::vector<std::pair<std::string,std::string>> hashes;
     for (const auto& entry : criticalFiles()) {
-        std::string h = sha256file(entry.path);
-        if (!h.empty())
+        const std::string h = sha256file(entry.path);
+        if (!h.empty()) {
             hashes.push_back({ entry.path, h });
+            continue;
+        }
+        // Present mais illisible : l'omettre en silence laissait un trou dans la
+        // surveillance -- typiquement /etc/shadow quand SPP tourne sans root.
+        if (SafeFile::exists(entry.path)) return false;
+        // Reellement absent de cette machine : normal, on passe.
     }
-    return saveBaseline(hashes);
+    return !hashes.empty() && saveBaseline(hashes);
 }
 
 std::vector<IntegrityResult> FileIntegrity::check() {
@@ -216,64 +234,103 @@ bool FileIntegrity::hasBaseline() {
 }
 
 bool FileIntegrity::isBaselineTampered() {
-    struct stat st;
     // Pas de baseline = pas de falsification (juste absente)
-    if (stat(BASELINE_PATH.c_str(), &st) != 0) return false;
-    // Baseline presente mais signature absente = falsification
-    if (stat(SIG_PATH.c_str(), &st) != 0) return true;
+    if (!SafeFile::exists(BASELINE_PATH)) return false;
+    // Baseline presente mais signature ou cle absente = falsification
+    if (!SafeFile::exists(SIG_PATH)) return true;
+    if (!SafeFile::exists(KEY_PATH)) return true;
 
-    std::ifstream bf(BASELINE_PATH);
-    if (!bf.is_open()) return true;
-    std::ostringstream buf;
-    buf << bf.rdbuf();
-    std::string content = buf.str();
+    const std::string key = SafeFile::read(KEY_PATH);
+    if (key.size() != 32) return true;
 
-    std::ifstream sf(SIG_PATH);
-    if (!sf.is_open()) return true;
-    std::string stored;
-    std::getline(sf, stored);
+    const std::string content = SafeFile::read(BASELINE_PATH);
+    const std::string stored  = SafeFile::readLine(SIG_PATH);
 
-    return stored != hmacSha256hex(machineKey(), content);
+    return stored != hmacSha256hex(key, content);
+}
+
+// ─── service systemd ──────────────────────────────────────────────────────────
+
+// systemctl echoue legitimement quand l'unite n'existe pas encore ou plus :
+// son code de retour n'est pas significatif pour ces appels de nettoyage.
+static void runQuiet(const char* cmd) {
+    int rc = std::system(cmd);
+    (void)rc;
+}
+
+// Chemin reel du binaire : l'ancien "/usr/local/bin/spp" code en dur produisait
+// une unite morte des que SPP tournait depuis son repertoire de compilation.
+static std::string selfPath() {
+    char buf[PATH_MAX];
+    ssize_t n = ::readlink("/proc/self/exe", buf, sizeof(buf) - 1);
+    if (n <= 0) return "/usr/local/bin/spp";
+    buf[n] = '\0';
+    return std::string(buf);
 }
 
 bool FileIntegrity::isServiceEnabled() {
-    struct stat st;
-    return stat(WANTS_LINK.c_str(), &st) == 0;
+    return SafeFile::exists(TIMER_LINK);
 }
 
 bool FileIntegrity::enableService() {
-    struct stat st;
-    if (stat(WANTS_LINK.c_str(), &st) == 0) return true;
-    return symlink(SERVICE_FILE.c_str(), WANTS_LINK.c_str()) == 0;
+    if (!SafeFile::exists(SERVICE_FILE) || !SafeFile::exists(TIMER_FILE))
+        return false;
+    // systemctl pose le lien ET recharge systemd. Le symlink cree a la main
+    // laissait l'unite invisible jusqu'au redemarrage suivant.
+    return std::system("systemctl enable --now spp-integrity.timer 2>/dev/null") == 0;
 }
 
 bool FileIntegrity::disableService() {
-    return unlink(WANTS_LINK.c_str()) == 0;
+    // Echoue si l'unite n'a jamais existe : sans consequence, on nettoie ensuite.
+    runQuiet("systemctl disable --now spp-integrity.timer 2>/dev/null");
+    // Lien pose a la main par les versions precedentes de SPP.
+    if (::unlink(WANTS_LINK.c_str()) != 0 && errno != ENOENT) return false;
+    // Desactiver ce qui n'a jamais ete active n'est pas un echec.
+    return true;
 }
 
 bool FileIntegrity::purge() {
     disableService();
-    unlink(SERVICE_FILE.c_str());
-    unlink(SIG_PATH.c_str());
-    unlink(BASELINE_PATH.c_str());
-    rmdir("/var/lib/spp");
+    ::unlink(TIMER_FILE.c_str());
+    ::unlink(SERVICE_FILE.c_str());
+    ::unlink(SIG_PATH.c_str());
+    ::unlink(BASELINE_PATH.c_str());
+    ::unlink(KEY_PATH.c_str());
+    runQuiet("systemctl daemon-reload 2>/dev/null");
+    ::rmdir("/var/lib/spp");  // echoue tant que l'etat d'origine y reste : voulu
     return true;
 }
 
 bool FileIntegrity::installServiceFile() {
-    std::ofstream f(SERVICE_FILE);
-    if (!f.is_open()) return false;
-    f << "[Unit]\n"
-      << "Description=SPP File Integrity Check\n"
-      << "After=local-fs.target\n"
-      << "\n"
-      << "[Service]\n"
-      << "Type=oneshot\n"
-      << "ExecStart=/usr/local/bin/spp --check\n"
-      << "StandardOutput=journal\n"
-      << "StandardError=journal\n"
-      << "\n"
-      << "[Install]\n"
-      << "WantedBy=multi-user.target\n";
-    return f.good();
+    std::ostringstream service;
+    service << "[Unit]\n"
+            << "Description=SPP - controle d'integrite des fichiers systeme\n"
+            << "After=local-fs.target\n"
+            << "\n"
+            << "[Service]\n"
+            << "Type=oneshot\n"
+            << "ExecStart=" << selfPath() << " --check\n"
+            << "StandardOutput=journal\n"
+            << "StandardError=journal\n";
+    if (!SafeFile::writeAtomic(SERVICE_FILE, service.str(), 0644))
+        return false;
+
+    // Sans timer, un Type=oneshot accroche a multi-user.target ne verifie
+    // qu'une seule fois, au demarrage : ce n'est pas de la surveillance.
+    std::ostringstream timer;
+    timer << "[Unit]\n"
+          << "Description=SPP - controle d'integrite periodique\n"
+          << "\n"
+          << "[Timer]\n"
+          << "OnBootSec=2min\n"
+          << "OnUnitActiveSec=1h\n"
+          << "Persistent=true\n"
+          << "\n"
+          << "[Install]\n"
+          << "WantedBy=timers.target\n";
+    if (!SafeFile::writeAtomic(TIMER_FILE, timer.str(), 0644))
+        return false;
+
+    runQuiet("systemctl daemon-reload 2>/dev/null");
+    return true;
 }

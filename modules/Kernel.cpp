@@ -1,25 +1,39 @@
 #include "Kernel.hpp"
-#include <fstream>
-#include <string>
-#include <unistd.h>
+#include "SafeFile.hpp"
+#include "State.hpp"
+
+#include <sstream>
 #include <cerrno>
+#include <dirent.h>
+#include <unistd.h>
 
 const std::string KernelSecurity::SYSCTL_CONF = "/etc/sysctl.d/99-spp.conf";
 
-bool KernelSecurity::writePersistenceConf(const std::vector<std::pair<std::string,std::string>>& entries) {
+// ─── persistance ──────────────────────────────────────────────────────────────
+
+bool KernelSecurity::writeConf(const std::string& path,
+                               const std::string& header,
+                               const std::vector<std::pair<std::string, std::string>>& entries) {
     if (entries.empty())
-        return removePersistenceConf();
-    std::ofstream f(SYSCTL_CONF);
-    if (!f.is_open()) return false;
-    f << "# SPP - Systeme de Protection Patriote\n";
+        return ::unlink(path.c_str()) == 0 || errno == ENOENT;
+
+    std::ostringstream out;
+    out << "# " << header << '\n';
     for (const auto& [key, val] : entries)
-        f << key << " = " << val << '\n';
-    return f.good();
+        out << key << " = " << val << '\n';
+
+    return SafeFile::writeAtomic(path, out.str(), 0644);
+}
+
+bool KernelSecurity::writePersistenceConf(const std::vector<std::pair<std::string, std::string>>& entries) {
+    return writeConf(SYSCTL_CONF, "SPP - Systeme de Protection Patriote", entries);
 }
 
 bool KernelSecurity::removePersistenceConf() {
-    return unlink(SYSCTL_CONF.c_str()) == 0 || errno == ENOENT;
+    return ::unlink(SYSCTL_CONF.c_str()) == 0 || errno == ENOENT;
 }
+
+// ─── resolution des chemins ───────────────────────────────────────────────────
 
 std::string KernelSecurity::procPath(const std::string& key) {
     std::string path = "/proc/sys/";
@@ -28,36 +42,84 @@ std::string KernelSecurity::procPath(const std::string& key) {
     return path;
 }
 
-std::string KernelSecurity::readValue(const std::string& path) {
-    std::ifstream f(path);
-    std::string val;
-    if (!f.is_open())
-        return "";
-    std::getline(f, val);
-    auto end = val.find_last_not_of(" \t\r\n");
-    if (end != std::string::npos)
-        val = val.substr(0, end + 1);
-    return val;
+std::vector<std::string> KernelSecurity::targetPaths(const SysctlOption& opt) {
+    const std::string primary = procPath(opt.key);
+    std::vector<std::string> paths{ primary };
+
+    // net.*.conf.all.X ne s'applique pas aux interfaces deja configurees :
+    // sans ce fan-out, "Desactiver IPv6" ne desactive pas IPv6 sur eth0.
+    static const std::string kMarker = "/conf/all/";
+    const auto pos = primary.find(kMarker);
+    if (pos == std::string::npos)
+        return paths;
+
+    const std::string base = primary.substr(0, pos + 6);  // ".../conf/"
+    const std::string leaf = primary.substr(pos + kMarker.size());
+
+    DIR* dir = ::opendir(base.c_str());
+    if (!dir) return paths;
+    while (dirent* entry = ::readdir(dir)) {
+        const std::string name = entry->d_name;
+        if (name == "." || name == ".." || name == "all") continue;
+        paths.push_back(base + name + "/" + leaf);  // "default" et chaque interface
+    }
+    ::closedir(dir);
+    return paths;
 }
 
-bool KernelSecurity::writeValue(const std::string& path, const std::string& value) {
-    std::ofstream f(path);
-    if (!f.is_open())
-        return false;
-    f << value;
-    return f.good();
+// ─── lecture / ecriture ───────────────────────────────────────────────────────
+
+bool KernelSecurity::write(const SysctlOption& opt, const std::string& value) {
+    if (value.empty()) return false;
+
+    const auto paths = targetPaths(opt);
+    if (paths.empty()) return false;
+
+    // Capture l'etat d'origine avant de l'ecraser. Sans appel prealable a
+    // recordOriginal(), aucune restauration fidele n'est possible.
+    SppState::recordOriginal(opt.key, SafeFile::readLine(paths.front()));
+
+    // La cle primaire fait foi ; le fan-out sur les interfaces est best-effort
+    // (une interface peut disparaitre entre l'enumeration et l'ecriture).
+    bool ok = SafeFile::writeProc(paths.front(), value);
+    for (size_t i = 1; i < paths.size(); ++i)
+        SafeFile::writeProc(paths[i], value);
+    return ok;
 }
 
 bool KernelSecurity::apply(const SysctlOption& opt) {
-    return writeValue(procPath(opt.key), opt.hardened);
+    return write(opt, opt.hardened);
 }
 
 bool KernelSecurity::revert(const SysctlOption& opt) {
-    return writeValue(procPath(opt.key), opt.defaults);
+    // Aucun original enregistre = SPP n'a jamais touche cette cle : elle etait
+    // deja dans cet etat. Ne rien faire est le seul comportement sur, la colonne
+    // `defaults` ne refletant pas la realite de la distribution.
+    if (!SppState::hasOriginal(opt.key))
+        return true;
+
+    const std::string orig = SppState::original(opt.key);
+    return write(opt, orig.empty() ? opt.defaults : orig);
 }
 
 bool KernelSecurity::isHardened(const SysctlOption& opt) {
-    return readValue(procPath(opt.key)) == opt.hardened;
+    if (!exists(opt)) return false;
+    for (const auto& path : targetPaths(opt)) {
+        if (!SafeFile::exists(path)) continue;
+        if (SafeFile::readLine(path) != opt.hardened) return false;
+    }
+    return true;
+}
+
+bool KernelSecurity::exists(const SysctlOption& opt) {
+    return SafeFile::exists(procPath(opt.key));
+}
+
+std::vector<SysctlOption> KernelSecurity::available(const std::vector<SysctlOption>& opts) {
+    std::vector<SysctlOption> out;
+    for (const auto& opt : opts)
+        if (exists(opt)) out.push_back(opt);
+    return out;
 }
 
 std::vector<SysctlOption> KernelSecurity::kernelOptions() {
@@ -152,10 +214,12 @@ std::vector<SysctlOption> KernelSecurity::fsOptions() {
 std::vector<SysctlOption> KernelSecurity::netOptions() {
     return {
         {
-            "Anti-spoofing IP",
+            "Anti-spoofing IP (strict)",
             "net.ipv4.conf.all.rp_filter", "1", "0",
-            "Reverse Path Filtering : verifie que les paquets entrants arrivent par"
-            " la bonne interface. Bloque l'usurpation d'adresse IP."
+            "[!] CASSE : routage asymetrique, VPN, bridges Docker/libvirt."
+            " Reverse Path Filtering strict : verifie que les paquets entrants"
+            " arrivent par la bonne interface. Bloque l'usurpation d'adresse IP,"
+            " mais rejette aussi le trafic legitime multi-chemins."
         },
         {
             "Bloquer redirections ICMP (IPv4)",
@@ -196,14 +260,16 @@ std::vector<SysctlOption> KernelSecurity::netOptions() {
         {
             "Desactiver IPv6 (si inutilise)",
             "net.ipv6.conf.all.disable_ipv6", "1", "0",
-            "Desactive completement IPv6 si tu ne l'utilises pas. Reduit la surface"
-            " d'attaque en eliminant toute une famille de protocoles reseau."
+            "[!] CASSE : tout reseau IPv6, y compris certains FAI et VPN."
+            " Desactive IPv6 sur toutes les interfaces. Reduit la surface"
+            " d'attaque en eliminant une famille entiere de protocoles reseau."
         },
         {
             "Desactiver IP forwarding",
             "net.ipv4.ip_forward", "0", "1",
-            "Empeche la machine de router des paquets entre interfaces. A desactiver"
-            " si la machine n'est pas un routeur ou un VPN gateway."
+            "[!] CASSE : reseau des conteneurs Docker/Podman, machines virtuelles,"
+            " partage de connexion. Empeche la machine de router des paquets entre"
+            " interfaces. A n'activer que si elle n'est ni routeur ni passerelle VPN."
         },
         {
             "Protection TIME_WAIT TCP",

@@ -13,24 +13,39 @@
 #include "modules/AppArmor.hpp"
 #include "modules/Namespaces.hpp"
 
+#include <memory>
 #include <string>
 #include <vector>
 #include <iostream>
 #include <syslog.h>
+#include <unistd.h>
 
 using namespace ftxui;
 
+// std::vector<bool> est compacte en bits : impossible d'en prendre l'adresse
+// pour un Checkbox. Ce wrapper donne un bool adressable et stable.
 struct Flag { bool on = false; };
+
+// Codes de sortie du mode --check, exploites par systemd et le journal.
+enum ExitCode { EXIT_OK = 0, EXIT_ANOMALY = 1, EXIT_TAMPERED = 2, EXIT_USAGE = 3 };
 
 static int runIntegrityCheck() {
     if (!FileIntegrity::hasBaseline())
-        return 0;
+        return EXIT_OK;
 
-    auto results = FileIntegrity::check();
+    openlog("spp-integrity", LOG_PID, LOG_AUTHPRIV);
+
+    // L'interface verifiait deja ce point, pas le mode automatique : une
+    // baseline reecrite par un attaquant passait donc pour saine.
+    if (FileIntegrity::isBaselineTampered()) {
+        syslog(LOG_CRIT, "BASELINE FALSIFIEE - resultats non fiables");
+        std::cerr << "[SPP] BASELINE FALSIFIEE — resultats non fiables\n";
+        closelog();
+        return EXIT_TAMPERED;
+    }
+
     bool alert = false;
-
-    openlog("spp-integrity", LOG_PID, LOG_DAEMON);
-    for (const auto& r : results) {
+    for (const auto& r : FileIntegrity::check()) {
         if (r.status == IntegrityResult::MODIFIED) {
             syslog(LOG_WARNING, "MODIFIE : %s", r.path.c_str());
             std::cerr << "[SPP] MODIFIE : " << r.path << '\n';
@@ -43,55 +58,124 @@ static int runIntegrityCheck() {
     }
     closelog();
 
-    return alert ? 1 : 0;
+    return alert ? EXIT_ANOMALY : EXIT_OK;
 }
 
+// ─── groupes d'options ────────────────────────────────────────────────────────
+
+// Rassemble une famille d'options et son etat. `initial` memorise ce qui etait
+// vrai a l'ouverture : c'est lui qui permet de n'agir que sur ce que
+// l'utilisateur a reellement change.
+//
+// Mod fournit les statiques available/isHardened/apply/revert. KernelSecurity,
+// NamespacesSecurity, SELinuxSecurity et AppArmorSecurity partagent cette forme.
+template <typename Mod, typename Opt>
+struct Group {
+    std::vector<Opt>  opts;
+    std::vector<Flag> state;
+    std::vector<Flag> initial;
+    Components        comps;
+
+    // Renvoie le nombre d'options effectivement traitees.
+    int apply(int& ok, int& fail, std::vector<std::string>& journal) {
+        int changed = 0;
+        for (size_t i = 0; i < opts.size(); ++i) {
+            // Une option non touchee n'est jamais reecrite : c'est ce qui
+            // empeche SPP de degrader un reglage qu'il n'a pas pose.
+            if (state[i].on == initial[i].on) continue;
+
+            const bool success = state[i].on ? Mod::apply(opts[i]) : Mod::revert(opts[i]);
+            success ? ++ok : ++fail;
+            ++changed;
+            if (success)
+                journal.push_back((state[i].on ? "active : " : "desactive : ") + opts[i].name);
+        }
+        return changed;
+    }
+
+    void refresh() {
+        for (size_t i = 0; i < opts.size(); ++i)
+            state[i].on = Mod::isHardened(opts[i]);
+        initial = state;
+    }
+};
+
+// L'allocation sur le tas garantit que les bool* confies aux Checkbox restent
+// valides : un Group renvoye par valeur les invaliderait a la moindre copie.
+template <typename Mod, typename Opt, typename MakeFn>
+std::shared_ptr<Group<Mod, Opt>> makeGroup(std::vector<Opt> opts,
+                                           Component container,
+                                           MakeFn&& makeOption) {
+    auto g = std::make_shared<Group<Mod, Opt>>();
+    g->opts = Mod::available(opts);  // les cles absentes du systeme disparaissent
+    g->state.resize(g->opts.size());
+
+    for (size_t i = 0; i < g->opts.size(); ++i)
+        g->state[i].on = Mod::isHardened(g->opts[i]);
+    g->initial = g->state;
+
+    for (size_t i = 0; i < g->opts.size(); ++i) {
+        g->comps.push_back(makeOption(g->opts[i].name, g->opts[i].detail, &g->state[i].on));
+        container->Add(g->comps.back());
+    }
+    return g;
+}
+
+// ─── programme ────────────────────────────────────────────────────────────────
+
 int main(int argc, char* argv[]) {
-    if (argc > 1 && std::string(argv[1]) == "--check")
+    const std::string arg = (argc > 1) ? argv[1] : "";
+
+    if (arg == "--help" || arg == "-h") {
+        std::cout << "SPP — Systeme de Protection Patriote\n\n"
+                  << "  spp           interface de durcissement (root requis)\n"
+                  << "  spp --check   controle d'integrite ; 0 sain, 1 anomalie, 2 baseline falsifiee\n";
+        return EXIT_OK;
+    }
+
+    // Sans root, toutes les lectures /etc echouent et l'interface affiche un
+    // etat faux : tout parait non durci et chaque action echoue en silence.
+    if (geteuid() != 0) {
+        std::cerr << "SPP doit etre lance en root :  sudo spp\n";
+        return EXIT_USAGE;
+    }
+
+    if (arg == "--check")
         return runIntegrityCheck();
+
+    if (!arg.empty()) {
+        std::cerr << "Option inconnue : " << arg << "  (voir spp --help)\n";
+        return EXIT_USAGE;
+    }
 
     auto screen = ScreenInteractive::Fullscreen();
 
-    auto kernelOpts = KernelSecurity::kernelOptions();
-    auto fsOpts     = KernelSecurity::fsOptions();
-    auto netOpts    = KernelSecurity::netOptions();
-
-    std::vector<Flag> kernelState(kernelOpts.size());
-    std::vector<Flag> fsState(fsOpts.size());
-    std::vector<Flag> netState(netOpts.size());
-
-    for (size_t i = 0; i < kernelOpts.size(); ++i)
-        kernelState[i].on = KernelSecurity::isHardened(kernelOpts[i]);
-    for (size_t i = 0; i < fsOpts.size(); ++i)
-        fsState[i].on = KernelSecurity::isHardened(fsOpts[i]);
-    for (size_t i = 0; i < netOpts.size(); ++i)
-        netState[i].on = KernelSecurity::isHardened(netOpts[i]);
-
     auto makeOption = [](const std::string& name, const std::string& detail, bool* state) -> Component {
         auto cb = Checkbox(name, state);
-        return Renderer(cb, [cb, detail] {
+        // Convention : un detail prefixe "[!]" signale une option qui casse des
+        // usages courants. Il s'affiche en rouge, pas en gris discret.
+        const bool risky = detail.rfind("[!]", 0) == 0;
+        return Renderer(cb, [cb, detail, risky] {
             return vbox({
                 cb->Render(),
-                hbox({ text("   "), paragraph(detail) | color(Color::GrayDark) }),
+                hbox({ text("   "),
+                       paragraph(detail) | color(risky ? Color::Red : Color::GrayDark) }),
                 text(""),
             });
         });
     };
 
-    Components kernelComps, fsComps, netComps;
-    for (size_t i = 0; i < kernelOpts.size(); ++i)
-        kernelComps.push_back(makeOption(kernelOpts[i].name, kernelOpts[i].detail, &kernelState[i].on));
-    for (size_t i = 0; i < fsOpts.size(); ++i)
-        fsComps.push_back(makeOption(fsOpts[i].name, fsOpts[i].detail, &fsState[i].on));
-    for (size_t i = 0; i < netOpts.size(); ++i)
-        netComps.push_back(makeOption(netOpts[i].name, netOpts[i].detail, &netState[i].on));
-
     auto optionsContainer = Container::Vertical({});
-    for (auto& c : kernelComps) optionsContainer->Add(c);
-    for (auto& c : fsComps)     optionsContainer->Add(c);
-    for (auto& c : netComps)    optionsContainer->Add(c);
 
-    std::vector<std::pair<std::string,std::string>> dnsOpts = {
+    // Les groupes sont construits dans l'ordre d'affichage : la navigation
+    // clavier suit ainsi toujours ce que l'on voit a l'ecran.
+    auto kernelG  = makeGroup<KernelSecurity>(KernelSecurity::kernelOptions(),  optionsContainer, makeOption);
+    auto fsG      = makeGroup<KernelSecurity>(KernelSecurity::fsOptions(),      optionsContainer, makeOption);
+    auto netG     = makeGroup<KernelSecurity>(KernelSecurity::netOptions(),     optionsContainer, makeOption);
+
+    // DNS : deux reglages sans table d'options, traites a part.
+    const bool dnsAvailable = DNSSecurity::isAvailable();
+    std::vector<std::pair<std::string, std::string>> dnsOpts = {
         {"DNSSEC",
          "Verifie la signature cryptographique des reponses DNS."
          " Bloque le DNS spoofing et les attaques de type Kaminsky."},
@@ -99,116 +183,79 @@ int main(int argc, char* argv[]) {
          "Chiffre les requetes DNS via TLS. Empeche le FAI et les"
          " intermediaires de lire ou alterer vos resolutions DNS."},
     };
-
     std::vector<Flag> dnsState(dnsOpts.size());
-    dnsState[0].on = DNSSecurity::isDNSSECEnabled();
-    dnsState[1].on = DNSSecurity::isDNSOverTLSEnabled();
-
     Components dnsComps;
-    for (size_t i = 0; i < dnsOpts.size(); ++i)
-        dnsComps.push_back(makeOption(dnsOpts[i].first, dnsOpts[i].second, &dnsState[i].on));
+    if (dnsAvailable) {
+        dnsState[0].on = DNSSecurity::isDNSSECEnabled();
+        dnsState[1].on = DNSSecurity::isDNSOverTLSEnabled();
+        for (size_t i = 0; i < dnsOpts.size(); ++i) {
+            dnsComps.push_back(makeOption(dnsOpts[i].first, dnsOpts[i].second, &dnsState[i].on));
+            optionsContainer->Add(dnsComps.back());
+        }
+    }
+    std::vector<Flag> dnsInitial = dnsState;
 
-    for (auto& c : dnsComps) optionsContainer->Add(c);
+    auto memG     = makeGroup<KernelSecurity>(Optimization::memoryOptions(),  optionsContainer, makeOption);
+    auto netPerfG = makeGroup<KernelSecurity>(Optimization::networkOptions(), optionsContainer, makeOption);
 
-    auto memOpts     = Optimization::memoryOptions();
-    auto netPerfOpts = Optimization::networkOptions();
+    // SSH : un seul reglage.
+    const bool sshAvailable = SSHSecurity::isInstalled();
+    bool sshRootDisabled = sshAvailable && SSHSecurity::isRootLoginDisabled();
+    bool sshInitial      = sshRootDisabled;
+    Components sshComps;
+    if (sshAvailable) {
+        sshComps.push_back(makeOption(
+            "Bloquer les connexions root en SSH",
+            "Interdit la connexion directe en root via SSH. Ecrit un fichier"
+            " dedie dans sshd_config.d, sans toucher a la configuration systeme.",
+            &sshRootDisabled));
+        optionsContainer->Add(sshComps.back());
+    }
 
-    std::vector<Flag> memOptState(memOpts.size());
-    std::vector<Flag> netPerfState(netPerfOpts.size());
+    auto nsG = makeGroup<NamespacesSecurity>(NamespacesSecurity::options(), optionsContainer, makeOption);
 
-    for (size_t i = 0; i < memOpts.size(); ++i)
-        memOptState[i].on = KernelSecurity::isHardened(memOpts[i]);
-    for (size_t i = 0; i < netPerfOpts.size(); ++i)
-        netPerfState[i].on = KernelSecurity::isHardened(netPerfOpts[i]);
+    auto selModeG = makeGroup<SELinuxSecurity>(
+        SELinuxSecurity::isInstalled() ? SELinuxSecurity::modeOptions() : std::vector<SELinuxOption>{},
+        optionsContainer, makeOption);
+    auto selBoolG = makeGroup<SELinuxSecurity>(
+        SELinuxSecurity::isInstalled() ? SELinuxSecurity::booleanOptions() : std::vector<SELinuxOption>{},
+        optionsContainer, makeOption);
 
-    Components memOptComps, netPerfComps;
-    for (size_t i = 0; i < memOpts.size(); ++i)
-        memOptComps.push_back(makeOption(memOpts[i].name, memOpts[i].detail, &memOptState[i].on));
-    for (size_t i = 0; i < netPerfOpts.size(); ++i)
-        netPerfComps.push_back(makeOption(netPerfOpts[i].name, netPerfOpts[i].detail, &netPerfState[i].on));
+    auto aaEnforceG = makeGroup<AppArmorSecurity>(
+        AppArmorSecurity::isInstalled() ? AppArmorSecurity::enforcementOptions() : std::vector<AppArmorOption>{},
+        optionsContainer, makeOption);
+    auto aaProfileG = makeGroup<AppArmorSecurity>(
+        AppArmorSecurity::isInstalled() ? AppArmorSecurity::profileOptions() : std::vector<AppArmorOption>{},
+        optionsContainer, makeOption);
 
-    for (auto& c : memOptComps)  optionsContainer->Add(c);
-    for (auto& c : netPerfComps) optionsContainer->Add(c);
+    // ─── panneau droit ────────────────────────────────────────────────────────
 
-    bool sshRootDisabled = SSHSecurity::isRootLoginDisabled();
-    auto sshComp = makeOption(
-        "Bloquer les connexions root en SSH",
-        "Interdit la connexion directe en root via SSH.",
-        &sshRootDisabled
-    );
-    optionsContainer->Add(sshComp);
-
-    auto nsOpts = NamespacesSecurity::options();
-    std::vector<Flag> nsState(nsOpts.size());
-    for (size_t i = 0; i < nsOpts.size(); ++i)
-        nsState[i].on = NamespacesSecurity::isHardened(nsOpts[i]);
-
-    Components nsComps;
-    for (size_t i = 0; i < nsOpts.size(); ++i)
-        nsComps.push_back(makeOption(nsOpts[i].name, nsOpts[i].detail, &nsState[i].on));
-    for (auto& c : nsComps) optionsContainer->Add(c);
-
-    bool selinuxPresent = SELinuxSecurity::isInstalled();
-    bool aaPresent      = AppArmorSecurity::isInstalled();
-
-    auto selinuxModeOpts = selinuxPresent ? SELinuxSecurity::modeOptions()    : std::vector<SELinuxOption>{};
-    auto selinuxBoolOpts = selinuxPresent ? SELinuxSecurity::booleanOptions() : std::vector<SELinuxOption>{};
-
-    std::vector<Flag> selinuxModeState(selinuxModeOpts.size());
-    std::vector<Flag> selinuxBoolState(selinuxBoolOpts.size());
-
-    for (size_t i = 0; i < selinuxModeOpts.size(); ++i)
-        selinuxModeState[i].on = SELinuxSecurity::isHardened(selinuxModeOpts[i]);
-    for (size_t i = 0; i < selinuxBoolOpts.size(); ++i)
-        selinuxBoolState[i].on = SELinuxSecurity::isHardened(selinuxBoolOpts[i]);
-
-    Components selinuxModeComps, selinuxBoolComps;
-    for (size_t i = 0; i < selinuxModeOpts.size(); ++i)
-        selinuxModeComps.push_back(makeOption(selinuxModeOpts[i].name, selinuxModeOpts[i].detail, &selinuxModeState[i].on));
-    for (size_t i = 0; i < selinuxBoolOpts.size(); ++i)
-        selinuxBoolComps.push_back(makeOption(selinuxBoolOpts[i].name, selinuxBoolOpts[i].detail, &selinuxBoolState[i].on));
-
-    auto aaEnforceOpts = aaPresent ? AppArmorSecurity::enforcementOptions() : std::vector<AppArmorOption>{};
-    auto aaProfileOpts = aaPresent ? AppArmorSecurity::profileOptions()     : std::vector<AppArmorOption>{};
-
-    std::vector<Flag> aaEnforceState(aaEnforceOpts.size());
-    std::vector<Flag> aaProfileState(aaProfileOpts.size());
-
-    for (size_t i = 0; i < aaEnforceOpts.size(); ++i)
-        aaEnforceState[i].on = AppArmorSecurity::isHardened(aaEnforceOpts[i]);
-    for (size_t i = 0; i < aaProfileOpts.size(); ++i)
-        aaProfileState[i].on = AppArmorSecurity::isHardened(aaProfileOpts[i]);
-
-    Components aaEnforceComps, aaProfileComps;
-    for (size_t i = 0; i < aaEnforceOpts.size(); ++i)
-        aaEnforceComps.push_back(makeOption(aaEnforceOpts[i].name, aaEnforceOpts[i].detail, &aaEnforceState[i].on));
-    for (size_t i = 0; i < aaProfileOpts.size(); ++i)
-        aaProfileComps.push_back(makeOption(aaProfileOpts[i].name, aaProfileOpts[i].detail, &aaProfileState[i].on));
-
-    int trackerLevel = (int)HostsBlocker::currentLevel();
+    int trackerLevel   = (int)HostsBlocker::currentLevel();
+    int trackerInitial = trackerLevel;
 
     std::vector<std::string> trackerEntries = {
         "Aucune (par defaut)",
         "Minimum  —  19 domaines",
-        "Basique  —  79 domaines",
+        "Basique  —  78 domaines",
         "Hard     — 156 domaines",
     };
     auto trackerRadio = Radiobox(&trackerEntries, &trackerLevel);
 
     bool serviceEnabled = FileIntegrity::isServiceEnabled();
+    bool serviceInitial = serviceEnabled;
     std::vector<IntegrityResult> integrityResults;
     std::string integrityMsg;
     bool integrityIsError  = false;
     bool baselineTampered  = false;
 
-    auto serviceCheckbox = Checkbox("Activer au demarrage", &serviceEnabled);
+    auto serviceCheckbox = Checkbox("Verification horaire au demarrage", &serviceEnabled);
 
     auto baselineBtn = Button("[ Creer baseline ]", [&] {
         bool ok = FileIntegrity::generateBaseline();
         integrityIsError = !ok;
         baselineTampered = false;
         integrityMsg = ok ? "Baseline creee et signee dans /var/lib/spp/"
-                          : "Echec — lancez en sudo";
+                          : "Echec — fichier critique illisible";
         if (ok) integrityResults = FileIntegrity::check();
     });
 
@@ -233,124 +280,160 @@ int main(int argc, char* argv[]) {
         integrityMsg = anyBad ? "Anomalies detectees !" : "Tous les fichiers sont integres";
     });
 
+    // ─── actions ──────────────────────────────────────────────────────────────
+
     std::string statusMsg;
     bool statusIsError = false;
 
+    // Relit l'etat reel du systeme. Appelee apres chaque action : une case qui
+    // se recoche signale que l'operation n'a pas abouti.
+    auto refreshAll = [&] {
+        kernelG->refresh(); fsG->refresh(); netG->refresh();
+        memG->refresh(); netPerfG->refresh(); nsG->refresh();
+        selModeG->refresh(); selBoolG->refresh();
+        aaEnforceG->refresh(); aaProfileG->refresh();
+
+        if (dnsAvailable) {
+            dnsState[0].on = DNSSecurity::isDNSSECEnabled();
+            dnsState[1].on = DNSSecurity::isDNSOverTLSEnabled();
+        }
+        dnsInitial = dnsState;
+
+        if (sshAvailable) sshRootDisabled = SSHSecurity::isRootLoginDisabled();
+        sshInitial = sshRootDisabled;
+
+        trackerLevel   = (int)HostsBlocker::currentLevel();
+        trackerInitial = trackerLevel;
+        serviceEnabled = FileIntegrity::isServiceEnabled();
+        serviceInitial = serviceEnabled;
+    };
+
+    // Declares avant applyBtn : celui-ci desarme la confirmation de suppression.
+    std::string cleanupLabel = "[ Supprimer SPP ]";
+    bool cleanupArmed = false;
+
     auto applyBtn = Button("[ Appliquer ]", [&] {
+        cleanupArmed = false;
+        cleanupLabel = "[ Supprimer SPP ]";
+
         int ok = 0, fail = 0;
+        std::vector<std::string> journal;
 
-        auto applyGroup = [&](const std::vector<SysctlOption>& opts,
-                               const std::vector<Flag>& states) {
-            for (size_t i = 0; i < opts.size(); ++i) {
-                bool success = states[i].on
-                    ? KernelSecurity::apply(opts[i])
-                    : KernelSecurity::revert(opts[i]);
-                success ? ++ok : ++fail;
-            }
-        };
-        applyGroup(kernelOpts,  kernelState);
-        applyGroup(fsOpts,      fsState);
-        applyGroup(netOpts,     netState);
-        applyGroup(memOpts,     memOptState);
-        applyGroup(netPerfOpts, netPerfState);
+        int sysctlChanges = 0;
+        sysctlChanges += kernelG->apply(ok, fail, journal);
+        sysctlChanges += fsG->apply(ok, fail, journal);
+        sysctlChanges += netG->apply(ok, fail, journal);
+        sysctlChanges += memG->apply(ok, fail, journal);
+        sysctlChanges += netPerfG->apply(ok, fail, journal);
 
-        for (size_t i = 0; i < nsOpts.size(); ++i) {
-            bool success = nsState[i].on
-                ? NamespacesSecurity::apply(nsOpts[i])
-                : NamespacesSecurity::revert(nsOpts[i]);
-            success ? ++ok : ++fail;
+        const int nsChanges = nsG->apply(ok, fail, journal);
+
+        // La persistance liste TOUTES les options cochees, pas seulement celles
+        // qui viennent de changer : le fichier decrit l'etat vise, pas le delta.
+        if (sysctlChanges > 0) {
+            std::vector<std::pair<std::string, std::string>> entries;
+            auto collect = [&entries](const auto& g) {
+                for (size_t i = 0; i < g->opts.size(); ++i)
+                    if (g->state[i].on)
+                        entries.push_back({ g->opts[i].key, g->opts[i].hardened });
+            };
+            collect(kernelG); collect(fsG); collect(netG);
+            collect(memG);    collect(netPerfG);
+            KernelSecurity::writePersistenceConf(entries) ? ++ok : ++fail;
         }
 
-        // Persistance sysctl kernel : /etc/sysctl.d/99-spp.conf
-        std::vector<std::pair<std::string,std::string>> persistEntries;
-        auto collect = [&](const std::vector<SysctlOption>& opts, const std::vector<Flag>& states) {
-            for (size_t i = 0; i < opts.size(); ++i)
-                if (states[i].on)
-                    persistEntries.push_back({ opts[i].key, opts[i].hardened });
-        };
-        collect(kernelOpts, kernelState);
-        collect(fsOpts,     fsState);
-        collect(netOpts,    netState);
-        collect(memOpts,    memOptState);
-        collect(netPerfOpts, netPerfState);
-        KernelSecurity::writePersistenceConf(persistEntries) ? ++ok : ++fail;
-
-        // Persistance namespaces : /etc/sysctl.d/99-spp-ns.conf
-        std::vector<std::pair<std::string,std::string>> nsPersist;
-        for (size_t i = 0; i < nsOpts.size(); ++i)
-            if (nsState[i].on)
-                nsPersist.push_back({ nsOpts[i].key, nsOpts[i].hardened });
-        NamespacesSecurity::writePersistenceConf(nsPersist) ? ++ok : ++fail;
-
-        DNSSecurity::applyDNSSEC(dnsState[0].on)    ? ++ok : ++fail;
-        DNSSecurity::applyDNSOverTLS(dnsState[1].on) ? ++ok : ++fail;
-
-        SSHSecurity::applyDisableRootLogin(sshRootDisabled) ? ++ok : ++fail;
-
-        auto applySelinux = [&](const std::vector<SELinuxOption>& opts,
-                                 const std::vector<Flag>& states) {
-            for (size_t i = 0; i < opts.size(); ++i) {
-                bool success = states[i].on
-                    ? SELinuxSecurity::apply(opts[i])
-                    : SELinuxSecurity::revert(opts[i]);
-                success ? ++ok : ++fail;
-            }
-        };
-        applySelinux(selinuxModeOpts, selinuxModeState);
-        applySelinux(selinuxBoolOpts, selinuxBoolState);
-
-        auto applyAppArmor = [&](const std::vector<AppArmorOption>& opts,
-                                  const std::vector<Flag>& states) {
-            for (size_t i = 0; i < opts.size(); ++i) {
-                bool success = states[i].on
-                    ? AppArmorSecurity::apply(opts[i])
-                    : AppArmorSecurity::revert(opts[i]);
-                success ? ++ok : ++fail;
-            }
-        };
-        applyAppArmor(aaEnforceOpts, aaEnforceState);
-        applyAppArmor(aaProfileOpts,  aaProfileState);
-
-        bool hostsOk = HostsBlocker::apply((HostsBlocker::Level)trackerLevel);
-        hostsOk ? ++ok : ++fail;
-
-        if (serviceEnabled) {
-            FileIntegrity::installServiceFile();
-            FileIntegrity::enableService() ? ++ok : ++fail;
-        } else {
-            FileIntegrity::disableService() ? ++ok : ++fail;
+        if (nsChanges > 0) {
+            std::vector<std::pair<std::string, std::string>> entries;
+            for (size_t i = 0; i < nsG->opts.size(); ++i)
+                if (nsG->state[i].on)
+                    entries.push_back({ nsG->opts[i].key, nsG->opts[i].hardened });
+            NamespacesSecurity::writePersistenceConf(entries) ? ++ok : ++fail;
         }
+
+        if (dnsAvailable) {
+            if (dnsState[0].on != dnsInitial[0].on)
+                DNSSecurity::applyDNSSEC(dnsState[0].on) ? ++ok : ++fail;
+            if (dnsState[1].on != dnsInitial[1].on)
+                DNSSecurity::applyDNSOverTLS(dnsState[1].on) ? ++ok : ++fail;
+        }
+
+        // Aucun redemarrage de sshd si le reglage n'a pas bouge.
+        if (sshAvailable && sshRootDisabled != sshInitial) {
+            SSHSecurity::applyDisableRootLogin(sshRootDisabled) ? ++ok : ++fail;
+            journal.push_back(sshRootDisabled ? "active : blocage root SSH"
+                                              : "desactive : blocage root SSH");
+        }
+
+        selModeG->apply(ok, fail, journal);
+        selBoolG->apply(ok, fail, journal);
+        aaEnforceG->apply(ok, fail, journal);
+        aaProfileG->apply(ok, fail, journal);
+
+        if (trackerLevel != trackerInitial) {
+            HostsBlocker::apply((HostsBlocker::Level)trackerLevel) ? ++ok : ++fail;
+            journal.push_back("bloqueur de trackers : " +
+                              HostsBlocker::levelName((HostsBlocker::Level)trackerLevel));
+        }
+
+        if (serviceEnabled != serviceInitial) {
+            if (serviceEnabled) {
+                bool done = FileIntegrity::installServiceFile() && FileIntegrity::enableService();
+                done ? ++ok : ++fail;
+            } else {
+                FileIntegrity::disableService() ? ++ok : ++fail;
+            }
+            journal.push_back(serviceEnabled ? "active : controle d'integrite periodique"
+                                             : "desactive : controle d'integrite periodique");
+        }
+
+        // Trace d'audit : un durcissement doit laisser une trace de ce qu'il a change.
+        if (!journal.empty()) {
+            openlog("spp", LOG_PID, LOG_AUTHPRIV);
+            for (const auto& line : journal)
+                syslog(LOG_NOTICE, "%s", line.c_str());
+            closelog();
+        }
+
+        refreshAll();
 
         statusIsError = (fail > 0);
-        if (fail == 0)
-            statusMsg = " OK — " + std::to_string(ok) + " changements appliques";
+        if (ok == 0 && fail == 0)
+            statusMsg = " Aucun changement a appliquer";
+        else if (fail == 0)
+            statusMsg = " OK — " + std::to_string(ok) + " changement(s) applique(s)";
         else
             statusMsg = " " + std::to_string(ok) + " OK  |  " +
-                        std::to_string(fail) + " echec  (lancez en sudo)";
+                        std::to_string(fail) + " echec(s)";
     });
 
-    auto cleanupBtn = Button("[ Supprimer SPP ]", [&] {
+    // Bouton destructif : il exige une seconde pression, son libelle changeant
+    // entre-temps. Il jouxte [ Appliquer ], une frappe suffisait auparavant.
+    auto cleanupBtn = Button(&cleanupLabel, [&] {
+        if (!cleanupArmed) {
+            cleanupArmed  = true;
+            cleanupLabel  = "[ Confirmer ? ]";
+            statusIsError = true;
+            statusMsg = " Retire les reglages SPP et restaure l'etat d'origine — confirmez";
+            return;
+        }
+        cleanupArmed = false;
+        cleanupLabel = "[ Supprimer SPP ]";
+
         auto r = Cleanup::removeAllTraces();
-        statusIsError = (r.fail > 0);
-        if (r.fail == 0)
-            statusMsg = " Toutes les traces SPP ont ete supprimees";
-        else
-            statusMsg = " " + std::to_string(r.ok) + " OK  |  " +
-                        std::to_string(r.fail) + " echec  (lancez en sudo)";
-        // Reflete la suppression dans l'interface
-        trackerLevel    = (int)HostsBlocker::NONE;
-        serviceEnabled  = false;
+
+        openlog("spp", LOG_PID, LOG_AUTHPRIV);
+        syslog(LOG_NOTICE, "desinstallation : %d restaure(s), %d echec(s)", r.ok, r.fail);
+        closelog();
+
         baselineTampered = false;
         integrityResults.clear();
         integrityMsg.clear();
-        for (size_t i = 0; i < selinuxModeState.size(); ++i)
-            selinuxModeState[i].on = SELinuxSecurity::isHardened(selinuxModeOpts[i]);
-        for (size_t i = 0; i < selinuxBoolState.size(); ++i)
-            selinuxBoolState[i].on = SELinuxSecurity::isHardened(selinuxBoolOpts[i]);
-        for (size_t i = 0; i < aaEnforceState.size(); ++i)
-            aaEnforceState[i].on = AppArmorSecurity::isHardened(aaEnforceOpts[i]);
-        for (size_t i = 0; i < aaProfileState.size(); ++i)
-            aaProfileState[i].on = AppArmorSecurity::isHardened(aaProfileOpts[i]);
+        refreshAll();  // relit tout : l'ancien code ne rafraichissait que SELinux/AppArmor
+
+        statusIsError = (r.fail > 0);
+        statusMsg = (r.fail == 0)
+            ? " Reglages SPP retires, etat d'origine restaure"
+            : " " + std::to_string(r.ok) + " OK  |  " + std::to_string(r.fail) + " echec(s)";
     });
 
     auto quitBtn = Button("[ Quitter ]", screen.ExitLoopClosure());
@@ -361,10 +444,6 @@ int main(int argc, char* argv[]) {
         baselineBtn,
         verifyBtn,
     });
-    for (auto& c : selinuxModeComps) optionsContainer->Add(c);
-    for (auto& c : selinuxBoolComps) optionsContainer->Add(c);
-    for (auto& c : aaEnforceComps)   optionsContainer->Add(c);
-    for (auto& c : aaProfileComps)   optionsContainer->Add(c);
 
     auto layout = Container::Vertical({
         Container::Horizontal({
@@ -373,6 +452,8 @@ int main(int argc, char* argv[]) {
         }),
         Container::Horizontal({applyBtn, cleanupBtn, quitBtn}),
     });
+
+    // ─── rendu ────────────────────────────────────────────────────────────────
 
     auto renderer = Renderer(layout, [&] {
         auto sectionHeader = [](const std::string& title, Color c) -> Element {
@@ -383,41 +464,29 @@ int main(int argc, char* argv[]) {
         };
 
         std::vector<Element> optLines;
-        optLines.push_back(sectionHeader("KERNEL", Color::Yellow));
-        for (auto& c : kernelComps) optLines.push_back(c->Render());
-        optLines.push_back(separator());
-        optLines.push_back(sectionHeader("FILESYSTEM", Color::Yellow));
-        for (auto& c : fsComps) optLines.push_back(c->Render());
-        optLines.push_back(separator());
-        optLines.push_back(sectionHeader("RESEAU", Color::Yellow));
-        for (auto& c : netComps) optLines.push_back(c->Render());
-        optLines.push_back(separator());
-        optLines.push_back(sectionHeader("DNS", Color::Cyan));
-        for (auto& c : dnsComps) optLines.push_back(c->Render());
-        optLines.push_back(separator());
-        optLines.push_back(sectionHeader("MEMOIRE", Color::Green));
-        for (auto& c : memOptComps) optLines.push_back(c->Render());
-        optLines.push_back(separator());
-        optLines.push_back(sectionHeader("PERF RESEAU", Color::Green));
-        for (auto& c : netPerfComps) optLines.push_back(c->Render());
-        optLines.push_back(separator());
-        optLines.push_back(sectionHeader("SSH", Color::Red));
-        optLines.push_back(sshComp->Render());
-        optLines.push_back(separator());
-        optLines.push_back(sectionHeader("NAMESPACES", Color::Magenta));
-        for (auto& c : nsComps) optLines.push_back(c->Render());
-        if (selinuxPresent) {
-            optLines.push_back(separator());
-            optLines.push_back(sectionHeader("SELINUX", Color::Blue));
-            for (auto& c : selinuxModeComps) optLines.push_back(c->Render());
-            for (auto& c : selinuxBoolComps) optLines.push_back(c->Render());
-        }
-        if (aaPresent) {
-            optLines.push_back(separator());
-            optLines.push_back(sectionHeader("APPARMOR", Color::Blue));
-            for (auto& c : aaEnforceComps)  optLines.push_back(c->Render());
-            for (auto& c : aaProfileComps)  optLines.push_back(c->Render());
-        }
+        // Une section vide (module absent, options filtrees) ne s'affiche pas.
+        // Un titre vide prolonge la section precedente, sans nouvel en-tete.
+        auto pushSection = [&](const std::string& title, Color c, const Components& comps) {
+            if (comps.empty()) return;
+            if (!title.empty()) {
+                if (!optLines.empty()) optLines.push_back(separator());
+                optLines.push_back(sectionHeader(title, c));
+            }
+            for (const auto& comp : comps) optLines.push_back(comp->Render());
+        };
+
+        pushSection("KERNEL",      Color::Yellow,  kernelG->comps);
+        pushSection("FILESYSTEM",  Color::Yellow,  fsG->comps);
+        pushSection("RESEAU",      Color::Yellow,  netG->comps);
+        pushSection("DNS",         Color::Cyan,    dnsComps);
+        pushSection("MEMOIRE",     Color::Green,   memG->comps);
+        pushSection("PERF RESEAU", Color::Green,   netPerfG->comps);
+        pushSection("SSH",         Color::Red,     sshComps);
+        pushSection("NAMESPACES",  Color::Magenta, nsG->comps);
+        pushSection("SELINUX",     Color::Blue,    selModeG->comps);
+        pushSection("",            Color::Blue,    selBoolG->comps);
+        pushSection("APPARMOR",    Color::Blue,    aaEnforceG->comps);
+        pushSection("",            Color::Blue,    aaProfileG->comps);
 
         auto trackerPanel = vbox({
             sectionHeader("BLOQUEUR DE TRACKERS", Color::Cyan),
@@ -432,7 +501,6 @@ int main(int argc, char* argv[]) {
             separator(),
             text(" Modifie /etc/hosts") | color(Color::Yellow) | dim,
             text(" Contenu original preserve") | color(Color::GrayDark) | dim,
-            text(" Requiert sudo") | color(Color::GrayDark) | dim,
         });
 
         std::vector<Element> intLines;
@@ -480,11 +548,11 @@ int main(int argc, char* argv[]) {
             );
         }
 
-        intLines.push_back(filler());
-        intLines.push_back(separator());
-        intLines.push_back(text(" Baseline : /var/lib/spp/") | color(Color::GrayDark) | dim);
-
-        auto integrityPanel = vbox(intLines);
+        auto integrityPanel = vbox({
+            vbox(intLines) | vscroll_indicator | frame | flex,
+            separator(),
+            text(" Baseline : /var/lib/spp/") | color(Color::GrayDark) | dim,
+        });
 
         Element status;
         if (statusMsg.empty()) {
@@ -505,7 +573,7 @@ int main(int argc, char* argv[]) {
                 vbox(optLines) | vscroll_indicator | frame | flex | border,
                 vbox({
                     trackerPanel    | border | flex,
-                    integrityPanel  | border,
+                    integrityPanel  | border | flex,
                 }) | size(WIDTH, EQUAL, 38),
             }) | flex,
 
@@ -522,5 +590,5 @@ int main(int argc, char* argv[]) {
     });
 
     screen.Loop(renderer);
-    return 0;
+    return EXIT_OK;
 }
