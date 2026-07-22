@@ -50,20 +50,9 @@ sudo apt install libftxui-dev
 ```bash
 git clone https://github.com/codenapol/SPP.git
 cd SPP
-g++ -std=c++17 -O2 \
-    main.cpp \
-    modules/Kernel.cpp \
-    modules/DNS.cpp \
-    modules/FileIntegrity.cpp \
-    modules/HostsBlocker.cpp \
-    modules/Optimization.cpp \
-    modules/Cleanup.cpp \
-    modules/SSH.cpp \
-    modules/SELinux.cpp \
-    modules/AppArmor.cpp \
-    modules/Namespaces.cpp \
-    -lftxui-component -lftxui-dom -lftxui-screen \
-    -o spp
+cmake -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build -j$(nproc)
+sudo cmake --install build   # optionnel, installe dans /usr/local/bin
 ```
 
 ## Utilisation
@@ -89,16 +78,18 @@ sudo ./spp --check
 SPP/
 ├── main.cpp              # Point d'entrée, interface TUI (FTXUI)
 └── modules/
-    ├── Kernel.cpp/.hpp   # Durcissement sysctl
-    ├── DNS.cpp/.hpp      # DNSSEC / DNS over TLS
-    ├── FileIntegrity.cpp/.hpp  # Baseline SHA-256 + service
-    ├── HostsBlocker.cpp/.hpp   # Blocage trackers /etc/hosts
-    ├── Optimization.cpp/.hpp   # Optimisations mémoire/réseau
-    ├── Cleanup.cpp/.hpp        # Suppression des traces
+    ├── SafeFile.cpp/.hpp       # Écriture atomique des fichiers système
+    ├── State.cpp/.hpp          # Capture/restauration de l'état système
+    ├── Kernel.cpp/.hpp         # Durcissement sysctl (kernel.*, fs.*, net.*)
+    ├── Optimization.cpp/.hpp   # Réglages perf mémoire (vm.*) et réseau
+    ├── Namespaces.cpp/.hpp     # Restriction user namespaces
+    ├── DNS.cpp/.hpp            # DNSSEC / DNS over TLS
     ├── SSH.cpp/.hpp            # Sécurité SSH
     ├── SELinux.cpp/.hpp        # Gestion SELinux
     ├── AppArmor.cpp/.hpp       # Gestion AppArmor
-    └── Namespaces.cpp/.hpp     # Isolation user namespaces
+    ├── HostsBlocker.cpp/.hpp   # Blocage trackers /etc/hosts
+    ├── FileIntegrity.cpp/.hpp  # Baseline SHA-256 + service systemd
+    └── Cleanup.cpp/.hpp        # Suppression des traces
 ```
 
 ## Avertissement
